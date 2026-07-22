@@ -1638,8 +1638,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if emptyGlyphs.contains(key) {
             return nil
         }
-        guard let bitmap = rasterizer.rasterize(font: font, glyph: glyph) else {
+        let bitmap: GlyphBitmap
+        switch rasterizer.rasterize(font: font, glyph: glyph) {
+        case .bitmap(let rasterized):
+            bitmap = rasterized
+        case .empty:
+            // Deterministic zero-ink glyph (space, tab, …): memoize so blank cells
+            // never hit the CoreText bounding-box path again.
             emptyGlyphs.insert(key)
+            return nil
+        case .failed:
+            // Transient rasterization failure for an otherwise-inked glyph. Do NOT
+            // memoize — retry on the next rebuild so a momentary failure can't
+            // permanently blank a valid glyph.
             return nil
         }
         let atlasKind: GlyphAtlasKind = bitmap.isColor ? .color : .grayscale
