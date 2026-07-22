@@ -205,6 +205,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private let colorAtlas: GlyphAtlas
     private let rasterizer = CoreTextGlyphRasterizer()
     private var glyphCache: [GlyphKey: GlyphEntry] = [:]
+    // Glyph keys whose ink bounding box is empty (space, tab, and other zero-ink
+    // glyphs). They never enter `glyphCache` because the rasterizer returns nil for
+    // them, so without this set every blank cell would re-run the expensive
+    // `CTFontGetBoundingRectsForGlyphs` on every row rebuild — and a terminal is
+    // mostly blank cells. Memoizing the negative keeps blank cells off the hot path.
+    private var emptyGlyphs: Set<GlyphKey> = []
     private var scaledFontCache: [GlyphKey: CTFont] = [:]
     private var customGlyphCache: [CustomGlyphKey: CustomGlyphEntry] = [:]
     private let imageTextureCache = NSMapTable<AnyObject, MTLTexture>(keyOptions: .weakMemory, valueOptions: .strongMemory)
@@ -1629,7 +1635,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let cached = glyphCache[key] {
             return cached
         }
+        if emptyGlyphs.contains(key) {
+            return nil
+        }
         guard let bitmap = rasterizer.rasterize(font: font, glyph: glyph) else {
+            emptyGlyphs.insert(key)
             return nil
         }
         let atlasKind: GlyphAtlasKind = bitmap.isColor ? .color : .grayscale
