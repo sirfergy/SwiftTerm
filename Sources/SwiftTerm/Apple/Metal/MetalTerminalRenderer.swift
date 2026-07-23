@@ -633,6 +633,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// finally one frozen pass that is guaranteed not to invalidate.
     private static let maxAtlasRebuildPasses = 5
 
+    /// Drop the per-row draw cache and the negative empty-ink cache so the next
+    /// draw rebuilds every visible row from the current terminal model.
+    ///
+    /// The renderer is paused and redraws on demand, memoizing per-row draw data
+    /// in `rowCache` (reused while a row's `lineRef`/`generation` are unchanged)
+    /// and negative empty-ink lookups in `emptyGlyphs` (checked before
+    /// re-rasterizing). If a transient CoreText failure ever rasterizes an inked
+    /// glyph as empty (e.g. a zero bounding box during a display-scale change on
+    /// wake), that empty result is memoized in `emptyGlyphs` AND baked into the
+    /// affected `rowCache` rows — and neither is invalidated by
+    /// `updateFullScreen()`/`setNeedsDisplay()`, because for an idle, unchanged
+    /// buffer the cache signature is stable and every row stays `cacheValid`, so
+    /// the surface stays blank (only the textureless cursor quad paints) until the
+    /// process restarts. Hosts call this on reveal / manual redraw to recover.
+    ///
+    /// `glyphCache`, `customGlyphCache`, and the glyph atlases are intentionally
+    /// retained: clearing `rowCache` alone forces a full rebuild, and dropping the
+    /// (still valid) glyph atlas would re-rasterize every healthy glyph and orphan
+    /// its atlas region on every call. Poisoned glyphs were never in `glyphCache`
+    /// (they went straight to `emptyGlyphs`), so clearing `emptyGlyphs` is what
+    /// lets them re-rasterize on the forced rebuild.
+    func invalidateRenderCaches() {
+        rowCache.removeAll()
+        emptyGlyphs.removeAll()
+    }
+
     private func buildDrawData(scale: CGFloat) -> DrawData {
         defer {
             grayscaleAtlas.frozen = false

@@ -247,6 +247,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     public var isUsingMetalRenderer: Bool {
         return useMetalRenderer
     }
+
+    /// Drop the Metal renderer's per-row and empty-ink caches so the next draw
+    /// rebuilds every visible row from the current terminal model. Recovers a
+    /// Metal surface stuck blank from empty cached rows or a poisoned empty-ink
+    /// cache; the valid glyph atlas is retained. The caller must request the redraw
+    /// afterwards. No-op when the Metal renderer is not active.
+    public func invalidateMetalRenderCaches() {
+        guard useMetalRenderer else { return }
+        metalRenderer?.invalidateRenderCaches()
+    }
 #endif
     var cellDimension: CellDimension
     var caretView: CaretView?

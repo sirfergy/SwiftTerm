@@ -286,7 +286,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public var isUsingMetalRenderer: Bool {
         return useMetalRenderer
     }
-
     /// Draws one Metal frame immediately when the Metal renderer is active.
     ///
     /// Normal applications do not need this method. It supports deterministic
@@ -296,8 +295,23 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         guard useMetalRenderer else { return }
         metalView?.draw()
     }
-#endif
 
+    /// Drop the Metal renderer's per-row and empty-ink caches so the next draw
+    /// rebuilds every visible row from the current terminal model.
+    ///
+    /// Use this to recover a Metal surface that is stuck blank: the paused,
+    /// on-demand renderer can hold empty cached rows (and a poisoned, never-cleared
+    /// empty-ink negative cache) that a plain `updateFullScreen()` +
+    /// `setNeedsDisplay()` cannot rebuild, because an idle unchanged buffer keeps
+    /// the cache signature stable and every row `cacheValid`. The valid glyph atlas
+    /// is retained, so healthy glyphs are not re-rasterized. The caller is
+    /// responsible for requesting the redraw afterwards (e.g. `setNeedsDisplay`).
+    /// No-op when the Metal renderer is not active.
+    public func invalidateMetalRenderCaches() {
+        guard useMetalRenderer else { return }
+        metalRenderer?.invalidateRenderCaches()
+    }
+#endif
     var cellDimension: CellDimension!
     var caretView: CaretView!
     var _fontSmoothing: Bool = true
