@@ -489,9 +489,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // `usingColorSpace(.deviceRGB)` are sRGB-encoded on modern macOS,
         // so this is the colorspace they actually live in.
         if let metalLayer = mtkView.layer as? CAMetalLayer {
+            metalLayer.maximumDrawableCount = 2
             metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
             // Composite through the layer when the background is translucent
             metalLayer.isOpaque = backgroundOpacity >= 1.0
+        } else {
+            assertionFailure("MTKView did not create a CAMetalLayer")
         }
         return mtkView
     }
@@ -503,16 +506,16 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// z-position instead. Actually removing the old view is the caller's
     /// responsibility — the rebind path defers removal until after the new
     /// view has drawn its first frame so the hierarchy is never empty.
-    private func insertMetalView(_ newView: MTKView, replacing oldView: MTKView?) {
-        if let caretView = caretView {
+    func insertMetalView(_ newView: MTKView, replacing oldView: MTKView?) {
+        if let caretView = caretView, caretView.superview === self {
             addSubview(newView, positioned: .below, relativeTo: caretView)
-            caretView.disableAnimations()
-            caretView.isHidden = true
         } else if let oldView = oldView {
             addSubview(newView, positioned: .above, relativeTo: oldView)
         } else {
             addSubview(newView, positioned: .below, relativeTo: nil)
         }
+        caretView?.disableAnimations()
+        caretView?.isHidden = true
         if let scroller = scroller {
             addSubview(scroller, positioned: .above, relativeTo: newView)
         }
