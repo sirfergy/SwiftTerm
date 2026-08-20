@@ -514,7 +514,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         mtkView.autoResizeDrawable = false
         mtkView.framebufferOnly = true
         mtkView.colorPixelFormat = .bgra8Unorm
-        (mtkView.layer as? CAMetalLayer)?.maximumDrawableCount = 2
         // Tag the metal layer with sRGB so the compositor color-manages our
         // pixels the same way it color-manages the layer-backed NSView
         // (whose backing store is in the display colorspace). Without this,
@@ -525,9 +524,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // `usingColorSpace(.deviceRGB)` are sRGB-encoded on modern macOS,
         // so this is the colorspace they actually live in.
         if let metalLayer = mtkView.layer as? CAMetalLayer {
+            metalLayer.maximumDrawableCount = 2
             metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
             // Composite through the layer when the background is translucent
             metalLayer.isOpaque = backgroundOpacity >= 1.0
+        } else {
+            assertionFailure("MTKView did not create a CAMetalLayer")
         }
         return mtkView
     }
@@ -542,13 +544,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     func insertMetalView(_ newView: MTKView, replacing oldView: MTKView?) {
         if let caretView = caretView, caretView.superview === self {
             addSubview(newView, positioned: .below, relativeTo: caretView)
-            caretView.disableAnimations()
-            caretView.isHidden = true
         } else if let oldView = oldView {
             addSubview(newView, positioned: .above, relativeTo: oldView)
         } else {
             addSubview(newView, positioned: .below, relativeTo: nil)
         }
+        caretView?.disableAnimations()
+        caretView?.isHidden = true
         if let scroller = scroller {
             addSubview(scroller, positioned: .above, relativeTo: newView)
         }
