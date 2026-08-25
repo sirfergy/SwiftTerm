@@ -659,6 +659,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         emptyGlyphs.removeAll()
     }
 
+#if DEBUG
+    struct RenderCacheCountsForTesting {
+        let rows: Int
+        let emptyGlyphs: Int
+    }
+
+    var renderCacheCountsForTesting: RenderCacheCountsForTesting {
+        RenderCacheCountsForTesting(rows: rowCache.count, emptyGlyphs: emptyGlyphs.count)
+    }
+
+    func seedRenderCachesForTesting(line: BufferLine, font: CTFont, glyph: CGGlyph) {
+        rowCache[0] = RowCacheEntry(
+            lineRef: line,
+            generation: line.generation,
+            bidiParagraphRevision: 0,
+            data: nil,
+            buffers: nil
+        )
+        emptyGlyphs.insert(GlyphKey(
+            fontName: CTFontCopyPostScriptName(font) as String,
+            size: CTFontGetSize(font),
+            glyph: glyph
+        ))
+    }
+#endif
+
     private func buildDrawData(scale: CGFloat) -> DrawData {
         defer {
             grayscaleAtlas.frozen = false

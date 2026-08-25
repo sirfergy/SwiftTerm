@@ -1,5 +1,6 @@
 #if os(macOS) && canImport(MetalKit)
 import AppKit
+import CoreText
 import MetalKit
 import Testing
 
@@ -17,5 +18,31 @@ struct MetalRendererToggleTests {
         #expect(metalView.superview === view)
         #expect(view.caretView.isHidden)
     }
+
+#if DEBUG
+    @Test(
+        "Metal cache invalidation clears stale rows and empty-glyph results",
+        .enabled(if: MTLCreateSystemDefaultDevice() != nil)
+    )
+    func invalidateMetalRenderCachesClearsRecoveryState() throws {
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 320))
+        try view.setUseMetal(true)
+
+        let renderer = try #require(view.metalRenderer)
+        let line = try #require(view.terminal.getLine(row: 0))
+        let font = CTFontCreateWithName("Menlo" as CFString, 13, nil)
+        renderer.seedRenderCachesForTesting(line: line, font: font, glyph: 1)
+
+        let populated = renderer.renderCacheCountsForTesting
+        #expect(populated.rows == 1)
+        #expect(populated.emptyGlyphs == 1)
+
+        view.invalidateMetalRenderCaches()
+
+        let invalidated = renderer.renderCacheCountsForTesting
+        #expect(invalidated.rows == 0)
+        #expect(invalidated.emptyGlyphs == 0)
+    }
+#endif
 }
 #endif

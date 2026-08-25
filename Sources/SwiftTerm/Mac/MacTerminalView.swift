@@ -524,7 +524,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // `usingColorSpace(.deviceRGB)` are sRGB-encoded on modern macOS,
         // so this is the colorspace they actually live in.
         if let metalLayer = mtkView.layer as? CAMetalLayer {
-            metalLayer.maximumDrawableCount = 2
             metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
             // Composite through the layer when the background is translucent
             metalLayer.isOpaque = backgroundOpacity >= 1.0
