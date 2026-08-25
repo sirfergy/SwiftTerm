@@ -248,14 +248,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         return useMetalRenderer
     }
 
-    /// Drop the Metal renderer's per-row and empty-ink caches so the next draw
-    /// rebuilds every visible row from the current terminal model. Recovers a
-    /// Metal surface stuck blank from empty cached rows or a poisoned empty-ink
-    /// cache; the valid glyph atlas is retained. The caller must request the redraw
-    /// afterwards. No-op when the Metal renderer is not active.
+    /// Drops the Metal renderer's row and empty-ink caches, then schedules a
+    /// redraw to recover a blank surface. No-op when Metal is not active.
     public func invalidateMetalRenderCaches() {
         guard useMetalRenderer else { return }
         metalRenderer?.invalidateRenderCaches()
+        requestMetalDisplay()
     }
 #endif
     var cellDimension: CellDimension
@@ -517,15 +515,15 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
 
     private func insertMetalView(_ newView: MTKView, replacing oldView: MTKView?) {
-        if let caretView {
+        if let caretView, caretView.superview === self {
             insertSubview(newView, belowSubview: caretView)
-            caretView.disableAnimations()
-            caretView.isHidden = true
         } else if let oldView {
             insertSubview(newView, aboveSubview: oldView)
         } else {
-            addSubview(newView)
+            insertSubview(newView, at: 0)
         }
+        caretView?.disableAnimations()
+        caretView?.isHidden = true
     }
 
     var isMetalRendererEligibleForRetry: Bool {

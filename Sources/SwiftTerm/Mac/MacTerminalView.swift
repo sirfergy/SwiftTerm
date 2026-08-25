@@ -296,20 +296,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         metalView?.draw()
     }
 
-    /// Drop the Metal renderer's per-row and empty-ink caches so the next draw
-    /// rebuilds every visible row from the current terminal model.
-    ///
-    /// Use this to recover a Metal surface that is stuck blank: the paused,
-    /// on-demand renderer can hold empty cached rows (and a poisoned, never-cleared
-    /// empty-ink negative cache) that a plain `updateFullScreen()` +
-    /// `setNeedsDisplay()` cannot rebuild, because an idle unchanged buffer keeps
-    /// the cache signature stable and every row `cacheValid`. The valid glyph atlas
-    /// is retained, so healthy glyphs are not re-rasterized. The caller is
-    /// responsible for requesting the redraw afterwards (e.g. `setNeedsDisplay`).
-    /// No-op when the Metal renderer is not active.
+    /// Drops the Metal renderer's row and empty-ink caches, then schedules a
+    /// redraw to recover a blank surface. No-op when Metal is not active.
     public func invalidateMetalRenderCaches() {
         guard useMetalRenderer else { return }
         metalRenderer?.invalidateRenderCaches()
+        requestMetalDisplay()
     }
 #endif
     var cellDimension: CellDimension!
@@ -527,8 +519,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
             // Composite through the layer when the background is translucent
             metalLayer.isOpaque = backgroundOpacity >= 1.0
-        } else {
-            assertionFailure("MTKView did not create a CAMetalLayer")
         }
         return mtkView
     }

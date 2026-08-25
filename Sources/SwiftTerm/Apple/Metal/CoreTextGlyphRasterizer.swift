@@ -4,11 +4,9 @@ import CoreText
 
 /// Outcome of a glyph rasterization attempt.
 ///
-/// `empty` and `failed` are deliberately distinct: `empty` is a deterministic
-/// property of the glyph (zero ink — space, tab, …) and is safe to memoize,
-/// whereas `failed` is a transient error (e.g. a `CGContext` allocation failure
-/// under memory pressure) for an otherwise-inked glyph and must NOT be cached, or
-/// a momentary failure would permanently blank a valid glyph.
+/// `empty` and `failed` are deliberately distinct: `empty` means CoreText
+/// reported no ink and can be negative-cached until explicit recovery, while
+/// `failed` is a transient rendering error that must be retried on a later frame.
 enum GlyphRasterization {
     case bitmap(GlyphBitmap)
     case empty
