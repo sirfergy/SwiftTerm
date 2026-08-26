@@ -2,14 +2,25 @@
 import CoreGraphics
 import CoreText
 
+/// Outcome of a glyph rasterization attempt.
+///
+/// `empty` and `failed` are deliberately distinct: `empty` means CoreText
+/// reported no ink and can be negative-cached until explicit recovery, while
+/// `failed` is a transient rendering error that must be retried on a later frame.
+enum GlyphRasterization {
+    case bitmap(GlyphBitmap)
+    case empty
+    case failed
+}
+
 final class CoreTextGlyphRasterizer {
     var fontSmoothing: Bool = true
 
-    func rasterize(font: CTFont, glyph: CGGlyph) -> GlyphBitmap? {
+    func rasterize(font: CTFont, glyph: CGGlyph) -> GlyphRasterization {
         var glyphVar = glyph
         let rect = CTFontGetBoundingRectsForGlyphs(font, .default, &glyphVar, nil, 1)
         if rect.width <= 0 || rect.height <= 0 {
-            return nil
+            return .empty
         }
 
         let minX = floor(rect.origin.x)
@@ -19,7 +30,7 @@ final class CoreTextGlyphRasterizer {
         let width = Int(maxX - minX)
         let height = Int(maxY - minY)
         if width <= 0 || height <= 0 {
-            return nil
+            return .empty
         }
 
         let bytesPerPixel = 4
@@ -64,7 +75,7 @@ final class CoreTextGlyphRasterizer {
             return true
         }
         if !drew {
-            return nil
+            return .failed
         }
 
         var isColor = false
@@ -80,11 +91,11 @@ final class CoreTextGlyphRasterizer {
             idx += 4
         }
 
-        return GlyphBitmap(width: width,
-                           height: height,
-                           bearing: CGPoint(x: minX, y: minY),
-                           pixels: pixels,
-                           isColor: isColor)
+        return .bitmap(GlyphBitmap(width: width,
+                                   height: height,
+                                   bearing: CGPoint(x: minX, y: minY),
+                                   pixels: pixels,
+                                   isColor: isColor))
     }
 }
 #endif
