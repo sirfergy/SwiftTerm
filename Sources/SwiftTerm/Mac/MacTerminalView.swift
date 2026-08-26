@@ -298,6 +298,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     /// Drops the Metal renderer's row and empty-ink caches, then schedules a
     /// redraw to recover a blank surface. No-op when Metal is not active.
+    @MainActor
     public func invalidateMetalRenderCaches() {
         guard useMetalRenderer else { return }
         metalRenderer?.invalidateRenderCaches()

@@ -132,6 +132,19 @@ struct DrawData {
 private enum GlyphEntryResult {
     case entry(GlyphEntry)
     case empty
+    case skip
+    case retry
+}
+
+private enum CustomGlyphBitmapResult {
+    case bitmap(CustomGlyphBitmap)
+    case skip
+    case retry
+}
+
+private enum CustomGlyphEntryResult {
+    case entry(CustomGlyphEntry)
+    case skip
     case retry
 }
 
@@ -226,6 +239,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var cacheBufferingMode: MetalBufferingMode?
     private var cacheSignature: CacheSignature?
     private var atlasInvalidatedDuringBuild = false
+    private var retryNeededDuringBuild = false
+    private var consecutiveRetryFrames = 0
     private var cursorBlinkTimer: Timer?
     private var cursorBlinkOn = true
     private lazy var frameCoordinator = MetalFrameCoordinator(
@@ -639,28 +654,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// (1024 -> ... -> maxSize) can invalidate passes, then one reset, and
     /// finally one frozen pass that is guaranteed not to invalidate.
     private static let maxAtlasRebuildPasses = 5
+    private static let maxTransientRetryFrames = 3
 
-    /// Drop the per-row draw cache and the negative empty-ink cache so the next
-    /// draw rebuilds every visible row from the current terminal model.
-    ///
-    /// The renderer is paused and redraws on demand, memoizing per-row draw data
-    /// in `rowCache` (reused while a row's `lineRef`/`generation` are unchanged)
-    /// and negative empty-ink lookups in `emptyGlyphs` (checked before
-    /// re-rasterizing). If a transient CoreText failure ever rasterizes an inked
-    /// glyph as empty (e.g. a zero bounding box during a display-scale change on
-    /// wake), that empty result is memoized in `emptyGlyphs` AND baked into the
-    /// affected `rowCache` rows — and neither is invalidated by
-    /// `updateFullScreen()`/`setNeedsDisplay()`, because for an idle, unchanged
-    /// buffer the cache signature is stable and every row stays `cacheValid`, so
-    /// the surface stays blank (only the textureless cursor quad paints) until the
-    /// process restarts. Hosts call this on reveal / manual redraw to recover.
-    ///
-    /// `glyphCache`, `customGlyphCache`, and the glyph atlases are intentionally
-    /// retained: clearing `rowCache` alone forces a full rebuild, and dropping the
-    /// (still valid) glyph atlas would re-rasterize every healthy glyph and orphan
-    /// its atlas region on every call. Poisoned glyphs were never in `glyphCache`
-    /// (they went straight to `emptyGlyphs`), so clearing `emptyGlyphs` is what
-    /// lets them re-rasterize on the forced rebuild.
+    /// Clears stale rows and negative empty-ink results so a manual recovery
+    /// redraw rebuilds the visible grid. Healthy glyphs and atlases are retained.
     func invalidateRenderCaches() {
         rowCache.removeAll()
         emptyGlyphs.removeAll()
@@ -682,8 +679,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 colorAtlas.frozen = true
             }
             atlasInvalidatedDuringBuild = false
+            retryNeededDuringBuild = false
             let result = buildDrawDataPass(scale: scale)
             if !atlasInvalidatedDuringBuild || attempt >= Self.maxAtlasRebuildPasses {
+                scheduleTransientRetryIfNeeded()
                 return result
             }
             // The invalidation site flushed the caches, but the row being
@@ -694,6 +693,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             attempt += 1
             GlyphAtlas.log.info("glyph atlas changed during frame build; rebuild pass \(attempt)/\(Self.maxAtlasRebuildPasses)")
         }
+    }
+
+    private func scheduleTransientRetryIfNeeded() {
+        guard retryNeededDuringBuild else {
+            consecutiveRetryFrames = 0
+            return
+        }
+        guard consecutiveRetryFrames < Self.maxTransientRetryFrames else {
+            return
+        }
+        consecutiveRetryFrames += 1
+        terminalView?.queueMetalDisplay()
     }
 
     private func buildDrawDataPass(scale: CGFloat) -> DrawData {
@@ -795,6 +806,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        func buildRow(_ row: Int) -> RowBuildResult {
+            buildRowDrawData(row: row,
+                             buffer: buffer,
+                             yDisp: visibleDisp,
+                             cellWidth: cellWidth,
+                             cellHeight: cellHeight,
+                             yOffset: yOffset,
+                             viewWidthPx: viewWidthPx,
+                             scale: scale,
+                             virtualPlacementsByImageId: virtualPlacementsByImageId)
+        }
+
         var rebuiltRows = 0
         var cachedRows = 0
         for row in visibleRange {
@@ -817,38 +840,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let rowBuffers: RowDrawBuffers?
             let rowData: RowDrawData
             var rowCacheable = true
-            if needsRebuild {
-                let build = buildRowDrawData(row: row,
-                                             buffer: buffer,
-                                             yDisp: visibleDisp,
-                                             cellWidth: cellWidth,
-                                             cellHeight: cellHeight,
-                                             yOffset: yOffset,
-                                             viewWidthPx: viewWidthPx,
-                                             scale: scale,
-                                             virtualPlacementsByImageId: virtualPlacementsByImageId)
-                rowData = build.data
-                rowCacheable = build.cacheable
-                let buffers = bufferingMode == .perRowPersistent ? makeRowBuffers(from: rowData) : nil
-                entry = RowCacheEntry(lineRef: line, generation: lineGeneration,
-                                      bidiParagraphRevision: bidiParagraphRevision,
-                                      data: rowData, buffers: buffers)
-                rowCache[row] = entry
-                rowBuffers = buffers
-                rebuiltRows += 1
-            } else if let cached = entry {
+            if let cached = entry, !needsRebuild {
                 if let cachedData = cached.data {
                     rowData = cachedData
                 } else {
-                    let build = buildRowDrawData(row: row,
-                                                 buffer: buffer,
-                                                 yDisp: visibleDisp,
-                                                 cellWidth: cellWidth,
-                                                 cellHeight: cellHeight,
-                                                 yOffset: yOffset,
-                                                 viewWidthPx: viewWidthPx,
-                                                 scale: scale,
-                                                 virtualPlacementsByImageId: virtualPlacementsByImageId)
+                    let build = buildRow(row)
                     rowData = build.data
                     rowCacheable = build.cacheable
                 }
@@ -872,15 +868,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
                 cachedRows += 1
             } else {
-                let build = buildRowDrawData(row: row,
-                                             buffer: buffer,
-                                             yDisp: visibleDisp,
-                                             cellWidth: cellWidth,
-                                             cellHeight: cellHeight,
-                                             yOffset: yOffset,
-                                             viewWidthPx: viewWidthPx,
-                                             scale: scale,
-                                             virtualPlacementsByImageId: virtualPlacementsByImageId)
+                let build = buildRow(row)
                 rowData = build.data
                 rowCacheable = build.cacheable
                 let buffers = bufferingMode == .perRowPersistent ? makeRowBuffers(from: rowData) : nil
@@ -893,6 +881,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             if !rowCacheable {
                 rowCache.removeValue(forKey: row)
+                retryNeededDuringBuild = true
             }
             if let rowBuffers {
                 rows.append(rowBuffers)
@@ -1071,14 +1060,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             for item in lineInfo.boxDrawings {
                 let itemWidthPx = baseCellWidthPx * item.columnWidth
-                guard let entry = customGlyphEntry(codePoint: item.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: baseThicknessPx,
-                                                   antiAlias: false) else {
-                    continue
-                }
+                let result = customGlyphEntry(codePoint: item.codePoint,
+                                              cellWidthPx: itemWidthPx,
+                                              cellHeightPx: baseCellHeightPx,
+                                              scale: scale,
+                                              baseThicknessPx: baseThicknessPx,
+                                              antiAlias: false)
+                if case .retry = result { cacheable = false }
+                guard case .entry(let entry) = result else { continue }
                 let atlasSize = Float(grayscaleAtlas.size)
                 let u0 = Float(entry.region.x) / atlasSize
                 let v0 = Float(entry.region.y) / atlasSize
@@ -1113,14 +1102,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 } else {
                     itemWidthPx = baseCellWidthPx * element.columnWidth
                 }
-                guard let entry = customGlyphEntry(codePoint: element.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: 0,
-                                                   antiAlias: antiAliasBlocks) else {
-                    continue
-                }
+                let result = customGlyphEntry(codePoint: element.codePoint,
+                                              cellWidthPx: itemWidthPx,
+                                              cellHeightPx: baseCellHeightPx,
+                                              scale: scale,
+                                              baseThicknessPx: 0,
+                                              antiAlias: antiAliasBlocks)
+                if case .retry = result { cacheable = false }
+                guard case .entry(let entry) = result else { continue }
                 let atlasSize = Float(grayscaleAtlas.size)
                 let u0 = Float(entry.region.x) / atlasSize
                 let v0 = Float(entry.region.y) / atlasSize
@@ -1159,14 +1148,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             for item in lineInfo.powerlineGlyphs {
                 let itemWidthPx = baseCellWidthPx * item.columnWidth
-                guard let entry = customGlyphEntry(codePoint: item.codePoint,
-                                                   cellWidthPx: itemWidthPx,
-                                                   cellHeightPx: baseCellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: 0,
-                                                   antiAlias: true) else {
-                    continue
-                }
+                let result = customGlyphEntry(codePoint: item.codePoint,
+                                              cellWidthPx: itemWidthPx,
+                                              cellHeightPx: baseCellHeightPx,
+                                              scale: scale,
+                                              baseThicknessPx: 0,
+                                              antiAlias: true)
+                if case .retry = result { cacheable = false }
+                guard case .entry(let entry) = result else { continue }
                 let atlasSize = Float(grayscaleAtlas.size)
                 let u0 = Float(entry.region.x) / atlasSize
                 let v0 = Float(entry.region.y) / atlasSize
@@ -1395,16 +1384,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let scaledFont = scaledFontFor(font: glyphRun.font, scale: scale)
                     for i in 0..<glyphRun.glyphs.count {
                         let glyph = glyphRun.glyphs[i]
-                        let entry: GlyphEntry
-                        switch glyphEntry(for: scaledFont, glyph: glyph) {
-                        case .entry(let glyphEntry):
-                            entry = glyphEntry
-                        case .empty:
-                            continue
-                        case .retry:
+                        let result = glyphEntry(for: scaledFont, glyph: glyph)
+                        if case .retry = result {
                             cacheable = false
-                            continue
                         }
+                        guard case .entry(let entry) = result else { continue }
                         if entry.size.width <= 0 || entry.size.height <= 0 {
                             continue
                         }
@@ -1718,7 +1702,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let maybeRegion = atlas.ensureRegion(width: bitmap.width, height: bitmap.height)
         handleAtlasChange(atlas, previousSize: previousSize)
         guard let region = maybeRegion else {
-            return .retry
+            return .skip
         }
         atlas.write(region: region, pixels: bitmap.pixels, width: bitmap.width, height: bitmap.height)
         let entry = GlyphEntry(region: region,
@@ -1765,7 +1749,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                   cellHeightPx: Int,
                                   scale: CGFloat,
                                   baseThicknessPx: Int,
-                                  antiAlias: Bool) -> CustomGlyphEntry? {
+                                  antiAlias: Bool) -> CustomGlyphEntryResult {
         let scaleInt = max(1, Int(round(scale)))
         let key = CustomGlyphKey(codePoint: codePoint,
                                  cellWidthPx: cellWidthPx,
@@ -1774,21 +1758,27 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                  scale: scaleInt,
                                  antiAlias: antiAlias)
         if let cached = customGlyphCache[key] {
-            return cached
+            return .entry(cached)
         }
-        guard let bitmap = renderCustomGlyphBitmap(codePoint: codePoint,
-                                                   cellWidthPx: cellWidthPx,
-                                                   cellHeightPx: cellHeightPx,
-                                                   scale: scale,
-                                                   baseThicknessPx: baseThicknessPx,
-                                                   antiAlias: antiAlias) else {
-            return nil
+        let bitmap: CustomGlyphBitmap
+        switch renderCustomGlyphBitmap(codePoint: codePoint,
+                                       cellWidthPx: cellWidthPx,
+                                       cellHeightPx: cellHeightPx,
+                                       scale: scale,
+                                       baseThicknessPx: baseThicknessPx,
+                                       antiAlias: antiAlias) {
+        case .bitmap(let rendered):
+            bitmap = rendered
+        case .skip:
+            return .skip
+        case .retry:
+            return .retry
         }
         let previousSize = grayscaleAtlas.size
         let maybeRegion = grayscaleAtlas.ensureRegion(width: bitmap.width, height: bitmap.height)
         handleAtlasChange(grayscaleAtlas, previousSize: previousSize)
         guard let region = maybeRegion else {
-            return nil
+            return .skip
         }
         grayscaleAtlas.write(region: region,
                              pixels: bitmap.pixels,
@@ -1797,7 +1787,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let entry = CustomGlyphEntry(region: region,
                                      size: CGSize(width: bitmap.width, height: bitmap.height))
         customGlyphCache[key] = entry
-        return entry
+        return .entry(entry)
     }
 
     private func renderCustomGlyphBitmap(codePoint: UInt32,
@@ -1805,17 +1795,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                          cellHeightPx: Int,
                                          scale: CGFloat,
                                          baseThicknessPx: Int,
-                                         antiAlias: Bool) -> CustomGlyphBitmap? {
+                                         antiAlias: Bool) -> CustomGlyphBitmapResult {
         guard cellWidthPx > 0, cellHeightPx > 0 else {
-            return nil
+            return .skip
         }
         let bytesPerPixel = 4
         var pixels = Array(repeating: UInt8(0), count: cellWidthPx * cellHeightPx * bytesPerPixel)
+        var retryableFailure = false
         let drew = pixels.withUnsafeMutableBytes { raw -> Bool in
             guard let base = raw.baseAddress else {
+                retryableFailure = true
                 return false
             }
             guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+                retryableFailure = true
                 return false
             }
             let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
@@ -1826,6 +1819,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                           bytesPerRow: cellWidthPx * bytesPerPixel,
                                           space: colorSpace,
                                           bitmapInfo: bitmapInfo) else {
+                retryableFailure = true
                 return false
             }
 
@@ -1891,11 +1885,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
         guard drew else {
-            return nil
+            return retryableFailure ? .retry : .skip
         }
-        return CustomGlyphBitmap(width: cellWidthPx,
-                                 height: cellHeightPx,
-                                 pixels: pixels)
+        return .bitmap(CustomGlyphBitmap(width: cellWidthPx,
+                                         height: cellHeightPx,
+                                         pixels: pixels))
     }
 
     private func quadVertices(x0: CGFloat, y0: CGFloat, x1: CGFloat, y1: CGFloat, color: SIMD4<Float>) -> [ColorVertex] {
@@ -2504,12 +2498,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                           customGlyphsEnabled: terminalView.customBlockGlyphs) {
             let cursorCellWidthPx = max(1, Int(round(cellWidthPx * doublePosition * cursorColumnWidth)))
             let cursorCellHeightPx = max(1, Int(round(cellHeightPx)))
-            if let entry = customGlyphEntry(codePoint: UInt32(charData.code),
-                                            cellWidthPx: cursorCellWidthPx,
-                                            cellHeightPx: cursorCellHeightPx,
-                                            scale: scale,
-                                            baseThicknessPx: 0,
-                                            antiAlias: true) {
+            let result = customGlyphEntry(codePoint: UInt32(charData.code),
+                                          cellWidthPx: cursorCellWidthPx,
+                                          cellHeightPx: cursorCellHeightPx,
+                                          scale: scale,
+                                          baseThicknessPx: 0,
+                                          antiAlias: true)
+            if case .retry = result {
+                retryNeededDuringBuild = true
+            }
+            if case .entry(let entry) = result {
                 let atlasSize = Float(grayscaleAtlas.size)
                 let u0 = Float(entry.region.x) / atlasSize
                 let v0 = Float(entry.region.y) / atlasSize
@@ -2564,9 +2562,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             for i in 0..<runGlyphsCount {
                 let glyph = runGlyphs[i]
-                guard case .entry(let entry) = glyphEntry(for: scaledFont, glyph: glyph) else {
-                    continue
+                let result = glyphEntry(for: scaledFont, glyph: glyph)
+                if case .retry = result {
+                    retryNeededDuringBuild = true
                 }
+                guard case .entry(let entry) = result else { continue }
                 if entry.size.width <= 0 || entry.size.height <= 0 {
                     continue
                 }
