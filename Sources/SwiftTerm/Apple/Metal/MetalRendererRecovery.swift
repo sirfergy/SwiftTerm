@@ -103,6 +103,27 @@ struct MetalAutomaticRecoveryPolicy: Sendable {
     }
 }
 
+struct MetalTransientRetryPolicy: Sendable {
+    private static let maxAttempts = 3
+    private(set) var attempts = 0
+
+    mutating func shouldSchedule(retryNeeded: Bool) -> Bool {
+        guard retryNeeded else {
+            attempts = 0
+            return false
+        }
+        guard attempts < Self.maxAttempts else {
+            return false
+        }
+        attempts += 1
+        return true
+    }
+
+    mutating func reset() {
+        attempts = 0
+    }
+}
+
 #if canImport(os)
 enum MetalRecoverySignpost {
     static let log = OSLog(subsystem: "org.tirania.SwiftTerm", category: "MetalProfile")

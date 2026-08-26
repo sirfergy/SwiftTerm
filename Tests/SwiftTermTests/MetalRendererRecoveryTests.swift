@@ -66,6 +66,29 @@ private final class TestMetalRecoveryScheduler: MetalRecoveryScheduler {
         )
     }
 
+    @Test func transientRetryPolicyBoundsAttemptsAndResets() {
+        var policy = MetalTransientRetryPolicy()
+
+        let first = policy.shouldSchedule(retryNeeded: true)
+        let second = policy.shouldSchedule(retryNeeded: true)
+        let third = policy.shouldSchedule(retryNeeded: true)
+        let exhausted = policy.shouldSchedule(retryNeeded: true)
+        #expect(first)
+        #expect(second)
+        #expect(third)
+        #expect(!exhausted)
+        #expect(policy.attempts == 3)
+
+        let cleanFrame = policy.shouldSchedule(retryNeeded: false)
+        #expect(!cleanFrame)
+        #expect(policy.attempts == 0)
+        let afterCleanFrame = policy.shouldSchedule(retryNeeded: true)
+        #expect(afterCleanFrame)
+
+        policy.reset()
+        #expect(policy.attempts == 0)
+    }
+
     @Test func busyFrameRecordsPendingRedrawAndCoalescesRetry() throws {
         let clock = TestMetalRecoveryClock()
         let scheduler = TestMetalRecoveryScheduler()

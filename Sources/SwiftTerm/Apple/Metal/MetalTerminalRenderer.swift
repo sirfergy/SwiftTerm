@@ -129,21 +129,8 @@ struct DrawData {
     var cursorGlyphVerticesColor: [GlyphVertex]
 }
 
-private enum GlyphEntryResult {
-    case entry(GlyphEntry)
-    case empty
-    case skip
-    case retry
-}
-
-private enum CustomGlyphBitmapResult {
-    case bitmap(CustomGlyphBitmap)
-    case skip
-    case retry
-}
-
-private enum CustomGlyphEntryResult {
-    case entry(CustomGlyphEntry)
+private enum GlyphLookup<Value> {
+    case value(Value)
     case skip
     case retry
 }
@@ -240,7 +227,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var cacheSignature: CacheSignature?
     private var atlasInvalidatedDuringBuild = false
     private var retryNeededDuringBuild = false
-    private var consecutiveRetryFrames = 0
+    private var transientRetryPolicy = MetalTransientRetryPolicy()
     private var cursorBlinkTimer: Timer?
     private var cursorBlinkOn = true
     private lazy var frameCoordinator = MetalFrameCoordinator(
@@ -654,13 +641,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// (1024 -> ... -> maxSize) can invalidate passes, then one reset, and
     /// finally one frozen pass that is guaranteed not to invalidate.
     private static let maxAtlasRebuildPasses = 5
-    private static let maxTransientRetryFrames = 3
 
     /// Clears stale rows and negative empty-ink results so a manual recovery
     /// redraw rebuilds the visible grid. Healthy glyphs and atlases are retained.
     func invalidateRenderCaches() {
         rowCache.removeAll()
         emptyGlyphs.removeAll()
+        transientRetryPolicy.reset()
     }
 
     private func buildDrawData(scale: CGFloat) -> DrawData {
@@ -696,15 +683,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     private func scheduleTransientRetryIfNeeded() {
-        guard retryNeededDuringBuild else {
-            consecutiveRetryFrames = 0
-            return
+        guard transientRetryPolicy.shouldSchedule(retryNeeded: retryNeededDuringBuild) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let view = self.view else { return }
+            if self.terminalView?.metalView === view {
+                self.terminalView?.queueMetalDisplay()
+            } else {
+                view.setNeedsDisplay(view.bounds)
+            }
         }
-        guard consecutiveRetryFrames < Self.maxTransientRetryFrames else {
-            return
-        }
-        consecutiveRetryFrames += 1
-        terminalView?.queueMetalDisplay()
     }
 
     private func buildDrawDataPass(scale: CGFloat) -> DrawData {
@@ -1067,7 +1054,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                               baseThicknessPx: baseThicknessPx,
                                               antiAlias: false)
                 if case .retry = result { cacheable = false }
-                guard case .entry(let entry) = result else { continue }
+                guard case .value(let entry) = result else { continue }
                 let atlasSize = Float(grayscaleAtlas.size)
                 let u0 = Float(entry.region.x) / atlasSize
                 let v0 = Float(entry.region.y) / atlasSize
@@ -1109,7 +1096,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                               baseThicknessPx: 0,
                                               antiAlias: antiAliasBlocks)
                 if case .retry = result { cacheable = false }
-                guard case .entry(let entry) = result else { continue }
+                guard case .value(let entry) = result else { continue }
                 let atlasSize = Float(grayscaleAtlas.size)
                 let u0 = Float(entry.region.x) / atlasSize
                 let v0 = Float(entry.region.y) / atlasSize
@@ -1155,7 +1142,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                               baseThicknessPx: 0,
                                               antiAlias: true)
                 if case .retry = result { cacheable = false }
-                guard case .entry(let entry) = result else { continue }
+                guard case .value(let entry) = result else { continue }
                 let atlasSize = Float(grayscaleAtlas.size)
                 let u0 = Float(entry.region.x) / atlasSize
                 let v0 = Float(entry.region.y) / atlasSize
@@ -1388,7 +1375,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         if case .retry = result {
                             cacheable = false
                         }
-                        guard case .entry(let entry) = result else { continue }
+                        guard case .value(let entry) = result else { continue }
                         if entry.size.width <= 0 || entry.size.height <= 0 {
                             continue
                         }
@@ -1676,15 +1663,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private func glyphEntry(for font: CTFont, glyph: CGGlyph) -> GlyphEntryResult {
+    private func glyphEntry(for font: CTFont, glyph: CGGlyph) -> GlyphLookup<GlyphEntry> {
         let key = GlyphKey(fontName: CTFontCopyPostScriptName(font) as String,
                            size: CTFontGetSize(font),
                            glyph: glyph)
         if let cached = glyphCache[key] {
-            return .entry(cached)
+            return .value(cached)
         }
         if emptyGlyphs.contains(key) {
-            return .empty
+            return .skip
         }
         let bitmap: GlyphBitmap
         switch rasterizer.rasterize(font: font, glyph: glyph) {
@@ -1692,7 +1679,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             bitmap = rasterized
         case .empty:
             emptyGlyphs.insert(key)
-            return .empty
+            return .skip
         case .failed:
             return .retry
         }
@@ -1711,7 +1698,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                isColor: bitmap.isColor,
                                atlasKind: atlasKind)
         glyphCache[key] = entry
-        return .entry(entry)
+        return .value(entry)
     }
 
     private func scaledFontFor(font: CTFont, scale: CGFloat) -> CTFont {
@@ -1749,7 +1736,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                   cellHeightPx: Int,
                                   scale: CGFloat,
                                   baseThicknessPx: Int,
-                                  antiAlias: Bool) -> CustomGlyphEntryResult {
+                                  antiAlias: Bool) -> GlyphLookup<CustomGlyphEntry> {
         let scaleInt = max(1, Int(round(scale)))
         let key = CustomGlyphKey(codePoint: codePoint,
                                  cellWidthPx: cellWidthPx,
@@ -1758,7 +1745,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                  scale: scaleInt,
                                  antiAlias: antiAlias)
         if let cached = customGlyphCache[key] {
-            return .entry(cached)
+            return .value(cached)
         }
         let bitmap: CustomGlyphBitmap
         switch renderCustomGlyphBitmap(codePoint: codePoint,
@@ -1767,7 +1754,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                        scale: scale,
                                        baseThicknessPx: baseThicknessPx,
                                        antiAlias: antiAlias) {
-        case .bitmap(let rendered):
+        case .value(let rendered):
             bitmap = rendered
         case .skip:
             return .skip
@@ -1787,7 +1774,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let entry = CustomGlyphEntry(region: region,
                                      size: CGSize(width: bitmap.width, height: bitmap.height))
         customGlyphCache[key] = entry
-        return .entry(entry)
+        return .value(entry)
     }
 
     private func renderCustomGlyphBitmap(codePoint: UInt32,
@@ -1795,7 +1782,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                          cellHeightPx: Int,
                                          scale: CGFloat,
                                          baseThicknessPx: Int,
-                                         antiAlias: Bool) -> CustomGlyphBitmapResult {
+                                         antiAlias: Bool) -> GlyphLookup<CustomGlyphBitmap> {
         guard cellWidthPx > 0, cellHeightPx > 0 else {
             return .skip
         }
@@ -1887,9 +1874,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         guard drew else {
             return retryableFailure ? .retry : .skip
         }
-        return .bitmap(CustomGlyphBitmap(width: cellWidthPx,
-                                         height: cellHeightPx,
-                                         pixels: pixels))
+        return .value(CustomGlyphBitmap(width: cellWidthPx,
+                                        height: cellHeightPx,
+                                        pixels: pixels))
     }
 
     private func quadVertices(x0: CGFloat, y0: CGFloat, x1: CGFloat, y1: CGFloat, color: SIMD4<Float>) -> [ColorVertex] {
@@ -2507,7 +2494,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if case .retry = result {
                 retryNeededDuringBuild = true
             }
-            if case .entry(let entry) = result {
+            if case .value(let entry) = result {
                 let atlasSize = Float(grayscaleAtlas.size)
                 let u0 = Float(entry.region.x) / atlasSize
                 let v0 = Float(entry.region.y) / atlasSize
@@ -2566,7 +2553,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 if case .retry = result {
                     retryNeededDuringBuild = true
                 }
-                guard case .entry(let entry) = result else { continue }
+                guard case .value(let entry) = result else { continue }
                 if entry.size.width <= 0 || entry.size.height <= 0 {
                     continue
                 }
