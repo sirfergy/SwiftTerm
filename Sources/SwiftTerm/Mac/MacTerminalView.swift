@@ -288,9 +288,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     /// Draws one Metal frame immediately when the Metal renderer is active.
     ///
-    /// Normal applications do not need this method. It supports deterministic
-    /// snapshots and tests when the main run loop cannot process an on-demand
-    /// `MTKView` draw before the snapshot starts.
+    /// Hosts can use this for explicit manual recovery or deterministic snapshots
+    /// when the main run loop cannot process an on-demand draw first.
     public func drawMetalFrameNow() {
         guard useMetalRenderer else { return }
         metalView?.draw()
