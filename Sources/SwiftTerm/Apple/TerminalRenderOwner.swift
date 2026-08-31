@@ -126,6 +126,7 @@ private struct TerminalRenderState {
 #if canImport(MetalKit)
     var renderer: MetalTerminalRenderer?
     var needsExternalDraw = false
+    var metalRenderingSuspended = false
 #endif
 }
 
@@ -783,6 +784,7 @@ final class TerminalRenderOwner: Sendable {
                          "Install a Metal renderer only after removing the old renderer")
             state.renderer = renderer
             state.needsExternalDraw = needsExternalDraw
+            state.metalRenderingSuspended = false
         }
     }
 
@@ -790,14 +792,14 @@ final class TerminalRenderOwner: Sendable {
     /// first. Submitted GPU work retains only its own resources, not this owner.
     @MainActor
     func replaceMetalRenderer (_ renderer: MetalTerminalRenderer,
-                               needsExternalDraw: Bool) -> Bool {
+                               needsExternalDraw: Bool) {
         precondition(currentSession()?.terminal.terminalLock.isLockedByCurrentThread != true,
                      "Metal replacement cannot enter the render domain under the terminal lock")
-        return withRenderState { state in
+        withRenderState { state in
             state.renderer?.retire()
             state.renderer = renderer
             state.needsExternalDraw = needsExternalDraw
-            return true
+            state.metalRenderingSuspended = false
         }
     }
 
@@ -872,7 +874,17 @@ final class TerminalRenderOwner: Sendable {
     }
 
     func renderMetal (frame: MetalDrawableFrame? = nil) {
-        withRenderState { $0.renderer?.render(frame: frame) }
+        withRenderState {
+            guard !$0.metalRenderingSuspended else { return }
+            $0.renderer?.render(frame: frame)
+        }
+    }
+
+    /// A surface awaiting window rebind must not submit more work while its
+    /// replacement waits for capacity, including through the main draw path.
+    @MainActor
+    func setMetalRenderingSuspended(_ suspended: Bool) {
+        withRenderState { $0.metalRenderingSuspended = suspended }
     }
 
     func discardPreparedMetalSnapshot () {
@@ -886,14 +898,14 @@ final class TerminalRenderOwner: Sendable {
 
     /// Like replacement, removal retires CPU ownership without a GPU wait.
     @MainActor
-    func removeMetalRenderer () -> Bool {
+    func removeMetalRenderer () {
         precondition(currentSession()?.terminal.terminalLock.isLockedByCurrentThread != true,
                      "Metal teardown cannot enter the render domain under the terminal lock")
-        return withRenderState { state in
+        withRenderState { state in
             state.renderer?.retire()
             state.renderer = nil
             state.needsExternalDraw = false
-            return true
+            state.metalRenderingSuspended = false
         }
     }
 
@@ -902,7 +914,6 @@ final class TerminalRenderOwner: Sendable {
         withRenderState { $0.renderer?.health }
     }
 
-    @MainActor
     func configureMetalFaultForTesting(creationFailure: MetalError? = nil,
                                        completionGate: MetalCompletionGate? = nil) {
         withRenderState {
