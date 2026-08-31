@@ -1591,6 +1591,21 @@ extension TerminalView {
         renderOwner.stateSnapshot()
     }
 
+    /// Copies input modes and dimensions without copying any rows.
+    /// Returns nil when no terminal session is attached.
+    public nonisolated func terminalInputStateSnapshot() -> TerminalInputStateSnapshot? {
+        renderOwner.inputStateSnapshot()
+    }
+
+    /// Copies a bounded region and its input state in one transaction.
+    /// Returns nil when no terminal session is attached. The returned values
+    /// remain valid after later feeds, resizes, scrolls, and history trimming.
+    public nonisolated func terminalContentSnapshot(
+        region: TerminalContentRegion
+    ) -> TerminalContentSnapshot? {
+        renderOwner.contentSnapshot(region: region)
+    }
+
     /// Copies terminal buffer contents without exposing the mutable terminal.
     public nonisolated func getBufferAsData(
         kind: Terminal.BufferKind = .active,
@@ -4435,6 +4450,26 @@ extension TerminalView {
      */
     public func send (_ bytes: [UInt8]) {
         send (data: (bytes)[...])
+    }
+
+    /// Sends a mouse response using the currently negotiated protocol.
+    ///
+    /// Cell coordinates are zero-based. Pixel coordinates default to the cell
+    /// coordinates, matching Terminal.sendEvent. Negative or overflowing cell
+    /// coordinates are ignored. The host decides when to report an event;
+    /// this method does not consult allowMouseReporting or suppress off-mode
+    /// reports. Unlike keyboard input, mouse responses do not register an
+    /// OSC 133 semantic submission. Delivery is synchronous on the main actor,
+    /// after releasing the terminal lock.
+    public func sendMouseEvent(button: Int, release: Bool,
+                               shift: Bool = false, meta: Bool = false,
+                               control: Bool = false, col: Int, row: Int,
+                               pixelX: Int? = nil, pixelY: Int? = nil) {
+        guard let bytes = renderOwner.mouseEventBytes(
+            button: button, release: release, shift: shift, meta: meta,
+            control: control, col: col, row: row, pixelX: pixelX, pixelY: pixelY)
+        else { return }
+        terminalDelegate?.send(source: self, data: bytes[...])
     }
     
     func sendKeyUp ()
