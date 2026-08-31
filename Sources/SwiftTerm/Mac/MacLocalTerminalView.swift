@@ -9,8 +9,13 @@
 import Foundation
 import AppKit
 
+private struct WeakLocalProcessInputReference {
+    weak var value: LocalProcess?
+}
+
 /// Delegate for the ``LocalProcessTerminalView`` class that is used to
 /// notify the user of process-related changes.
+@MainActor
 public protocol LocalProcessTerminalViewDelegate: AnyObject {
     /**
      * This method is invoked to notify that the terminal has been resized to the specified number of columns and rows
@@ -36,11 +41,87 @@ public protocol LocalProcessTerminalViewDelegate: AnyObject {
     func hostCurrentDirectoryUpdate (source: TerminalView, directory: String?)
 
     /**
-     * This method will be invoked when the child process started by `startProcess` has terminated.
+     * This method is invoked when the child process started by `startProcess` has terminated.
+     * Use a serial `dispatchQueue` so data and termination callbacks stay ordered.
      * - Parameter source: the local process that terminated
-     * - Parameter exitCode: the exit code returned by the process, or nil if this was an error caused during the IO reading/writing
+     * - Parameter exitCode: the normalized exit status from 0 through 255, or nil when the process ended because of a signal or the wait failed
      */
     func processTerminated (source: TerminalView, exitCode: Int32?)
+}
+
+private final class LocalProcessTerminalViewProcessAdapter:
+    LocalProcessDelegate, LocalProcessBorrowedDataDelegate, Sendable
+{
+    private let renderOwner: TerminalRenderOwner
+    private let frameSignal: FrameDriverSignal
+    private let diagnosticsState: Locked<TerminalView.Diagnostics>
+    private let outputHandler: LockedVoidCallback
+    private let windowSize = Locked(winsize())
+    private let inputProcess = Locked(WeakLocalProcessInputReference())
+    private let terminationHandler: @MainActor @Sendable (Int32?) -> Void
+
+    init(renderOwner: TerminalRenderOwner,
+         frameSignal: FrameDriverSignal,
+         diagnosticsState: Locked<TerminalView.Diagnostics>,
+         outputHandler: LockedVoidCallback,
+         terminationHandler: @escaping @MainActor @Sendable (Int32?) -> Void) {
+        self.renderOwner = renderOwner
+        self.frameSignal = frameSignal
+        self.diagnosticsState = diagnosticsState
+        self.outputHandler = outputHandler
+        self.terminationHandler = terminationHandler
+    }
+
+    func updateWindowSize(_ value: winsize) {
+        windowSize.withLock { $0 = value }
+    }
+
+    func attachInputProcess(_ process: LocalProcess) {
+        inputProcess.withLock { $0.value = process }
+    }
+
+    func sendInput(_ bytes: [UInt8]) {
+        inputProcess.withLock { reference in
+            reference.value?.send(data: bytes[...])
+        }
+    }
+
+    func processTerminated(_ source: LocalProcess, exitCode: Int32?) {
+        let handler = terminationHandler
+        Task { @MainActor in
+            handler(exitCode)
+        }
+    }
+
+    func dataReceived(slice: ArraySlice<UInt8>) {
+        frameSignal.markDirty()
+        let parse = Profiling.begin(.ioParse, "bytes=%d", slice.count)
+        _ = renderOwner.feed(bytes: slice)
+        parse.end()
+        diagnosticsState.withLock { diagnostics in
+            diagnostics.bytesFed += slice.count
+            diagnostics.batches += 1
+        }
+        outputHandler.call()
+        frameSignal.markDirty()
+    }
+
+    func dataReceivedBorrowed(_ bytes: Span<UInt8>) {
+        frameSignal.markDirty()
+        let parse = Profiling.begin(.ioParse, "bytes=%d", bytes.count)
+        _ = renderOwner.feed(borrowedBytes: bytes)
+        parse.end()
+        diagnosticsState.withLock { diagnostics in
+            diagnostics.bytesFed += bytes.count
+            diagnostics.batches += 1
+        }
+        outputHandler.call()
+        frameSignal.markDirty()
+    }
+
+    func getWindowSize() -> winsize {
+        windowSize.withLock { $0 }
+    }
 }
 
 /**
@@ -63,10 +144,15 @@ public protocol LocalProcessTerminalViewDelegate: AnyObject {
  *
  * If you want additional control over the delegate methods implemented in this class, you can
  * subclass this and override the methods
+ *
+ * Terminal parsing for this view runs on the background LocalProcess IO thread. TerminalViewDelegate
+ * callbacks produced by parsing are marshalled back to the main thread by TerminalView.
  */
-open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate, LocalProcessDelegate {
+open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
     
     public internal(set) var process: LocalProcess!
+    private var processAdapter: LocalProcessTerminalViewProcessAdapter!
+    nonisolated private let processOutputHandler = LockedVoidCallback()
 
     public override init (frame: CGRect)
     {
@@ -90,7 +176,34 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate, LocalPr
     func setup ()
     {
         terminalDelegate = self
-        process = LocalProcess (delegate: self)
+        let adapter = LocalProcessTerminalViewProcessAdapter(
+            renderOwner: renderOwner,
+            frameSignal: frameSignal,
+            diagnosticsState: diagnosticsState,
+            outputHandler: processOutputHandler,
+            terminationHandler: { [weak self] exitCode in
+                guard let self, let process = self.process else { return }
+                self.processTerminated(process, exitCode: exitCode)
+            })
+        processAdapter = adapter
+        // Direct delivery keeps process output on the IO parse thread. The
+        // explicit main queue preserves UI lifecycle delivery.
+        process = LocalProcess(
+            delegate: adapter,
+            dispatchQueue: .main,
+            directDelivery: true)
+        adapter.attachInputProcess(process)
+        inputSender.replaceDelivery { [adapter] bytes in
+            adapter.sendInput(bytes)
+        }
+        adapter.updateWindowSize(getWindowSize())
+    }
+
+    /// Installs a notification that runs on the process parse thread after an
+    /// output batch is applied. The handler receives no mutable terminal state
+    /// and must return quickly.
+    public func setProcessOutputHandler(_ handler: (@Sendable () -> Void)?) {
+        processOutputHandler.replace(with: handler)
     }
     
     /**
@@ -102,11 +215,9 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate, LocalPr
      * This method is invoked to notify the client of the new columsn and rows that have been set by the UI
      */
     public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
-        guard process.running else {
-            return
-        }
         var size = getWindowSize()
-        let _ = PseudoTerminalHelpers.setWinSize(masterPtyDescriptor: process.childfd, windowSize: &size)
+        processAdapter.updateWindowSize(size)
+        guard process.updateWindowSize(&size) else { return }
         
         processDelegate?.sizeChanged (source: self, newCols: newCols, newRows: newRows)
     }
@@ -184,6 +295,7 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate, LocalPr
         // A nil environment keeps the LocalProcess default (TERM=xterm-256color);
         // hosts that want options.termName in the child's environment pass
         // Terminal.getEnvironmentVariables(termName:) explicitly
+        processAdapter.updateWindowSize(getWindowSize())
         process.startProcess(executable: executable, args: args, environment: environment, execName: execName, currentDirectory: currentDirectory)
     }
 
@@ -214,9 +326,12 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate, LocalPr
     open func getWindowSize () -> winsize
     {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
-        let pxW = Int((cellDimension?.width ?? 0) * CGFloat(terminal.cols) * scale)
-        let pxH = Int((cellDimension?.height ?? 0) * CGFloat(terminal.rows) * scale)
-        return winsize(ws_row: UInt16(terminal.rows), ws_col: UInt16(terminal.cols), ws_xpixel: UInt16(pxW), ws_ypixel: UInt16(pxH))
+        let dimensions = terminalDimensions
+        let pxW = Int((cellDimension?.width ?? 0) * CGFloat(dimensions.cols) * scale)
+        let pxH = Int((cellDimension?.height ?? 0) * CGFloat(dimensions.rows) * scale)
+        return winsize(ws_row: UInt16(dimensions.rows),
+                       ws_col: UInt16(dimensions.cols),
+                       ws_xpixel: UInt16(pxW), ws_ypixel: UInt16(pxH))
     }
 }
 
