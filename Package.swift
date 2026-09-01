@@ -1,4 +1,4 @@
-// swift-tools-version:6.0
+// swift-tools-version:6.2
 
 import PackageDescription
 import Foundation
@@ -16,12 +16,6 @@ let platformExcludes = ["Apple", "Mac", "iOS"]
 let platformExcludes: [String] = excludeAppleSources ? ["Apple", "Mac", "iOS"] : []
 #endif
 
-let isGitHubActions = ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true"
-let disableBenchmark = true
-let benchmarkDependencies: [Package.Dependency] = (isGitHubActions || disableBenchmark) ? [] : [
-    .package(url: "https://github.com/ordo-one/package-benchmark", .upToNextMajor(from: "1.29.11"))
-]
-
 let buildInfoTargets: [Target] = [
     .executableTarget(
         name: "SwiftTermBuildInfoGenerator",
@@ -32,6 +26,19 @@ let buildInfoTargets: [Target] = [
         capability: .buildTool(),
         dependencies: ["SwiftTermBuildInfoGenerator"]
     )
+]
+
+let portableGraphicsDependencies: [Target.Dependency] = [
+    .product(
+        name: "PNG",
+        package: "swift-png",
+        condition: .when(platforms: [.linux, .windows])
+    ),
+    .product(
+        name: "LZ77",
+        package: "swift-png",
+        condition: .when(platforms: [.linux, .windows])
+    ),
 ]
 
 #if os(Windows)
@@ -46,7 +53,7 @@ let products: [Product] = [
 let targets: [Target] = [
     .target(
         name: "SwiftTerm",
-        dependencies: [],
+        dependencies: portableGraphicsDependencies,
         path: "Sources/SwiftTerm",
         exclude: platformExcludes + ["Mac/README.md"],
         plugins: [
@@ -67,7 +74,8 @@ let targets: [Target] = [
         path: "Tests/SwiftTermTests",
         resources: [
             .copy("Fixtures/xterm-ghostty.infocmp"),
-            .copy("Fixtures/swifterm-terminfo.infocmp")
+            .copy("Fixtures/GhosttyFuzzCorpus"),
+            .copy("KittyGraphics/Fixtures")
         ]
     )
 ] + buildInfoTargets
@@ -81,24 +89,11 @@ let products: [Product] = [
     ),
 ]
 
-let benchmarkTargets: [Target] = (isGitHubActions || disableBenchmark) ? [] : [
-    .executableTarget(
-        name: "SwiftTermBenchmarks",
-        dependencies: [
-            "SwiftTerm",
-            .product(name: "Benchmark", package: "package-benchmark")
-        ],
-        path: "Benchmarks/SwiftTermBenchmarks",
-        plugins: [
-            .plugin(name: "BenchmarkPlugin", package: "package-benchmark")
-        ]
-    )
-]
-
 let targets: [Target] = [
     .target(
         name: "SwiftTerm",
         //
+        dependencies: portableGraphicsDependencies,
         // We can not use Swift Subprocess, because there is no way of configuring the child process to
         // be a controlling terminal, as it is posix-spawn based.
 //        dependencies: [
@@ -112,7 +107,9 @@ let targets: [Target] = [
         plugins: [
             .plugin(name: "SwiftTermBuildInfoPlugin")
         ]
-//        swiftSettings: [
+        // Left off deliberately: this is item 5 of Docs/io-cpu-profile.md and
+        // wants its own before/after, not a free ride on another change.
+//        ,swiftSettings: [
 //            .unsafeFlags(["-enforce-exclusivity=none"])
 //        ]
     ),
@@ -135,17 +132,18 @@ let targets: [Target] = [
         path: "Tests/SwiftTermTests",
         resources: [
             .copy("Fixtures/xterm-ghostty.infocmp"),
-            .copy("Fixtures/swifterm-terminfo.infocmp")
+            .copy("Fixtures/GhosttyFuzzCorpus"),
+            .copy("KittyGraphics/Fixtures")
         ]
     )
-] + benchmarkTargets + buildInfoTargets
+] + buildInfoTargets
 #endif
 
 let package = Package(
     name: "SwiftTerm",
     platforms: [
         .iOS(.v14),
-        (disableBenchmark ? .macOS(.v11) : .macOS(.v13)),
+        .macOS(.v11),
         .tvOS(.v13),
         .visionOS(.v1)
     ],
@@ -153,8 +151,9 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.3"),
-    ] + benchmarkDependencies,
+        .package(url: "https://github.com/tayloraswift/swift-png", from: "4.5.0"),
+    ],
 //        .package(url: "https://github.com/swiftlang/swift-subprocess", revision: "426790f3f24afa60b418450da0afaa20a8b3bdd4")
     targets: targets,
-    swiftLanguageModes: [.v5]
+    swiftLanguageModes: [.v6]
 )

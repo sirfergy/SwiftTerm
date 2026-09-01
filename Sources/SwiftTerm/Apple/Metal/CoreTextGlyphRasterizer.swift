@@ -2,23 +2,28 @@
 import CoreGraphics
 import CoreText
 
-/// Outcome of a glyph rasterization attempt.
-///
-/// `empty` and `failed` are deliberately distinct: `empty` means CoreText
-/// reported no ink and can be negative-cached until explicit recovery, while
-/// `failed` is a transient rendering error that must be retried on a later frame.
-enum GlyphRasterization {
+enum GlyphRasterizationResult {
     case bitmap(GlyphBitmap)
     case empty
-    case failed
+    case transientFailure
 }
 
 final class CoreTextGlyphRasterizer {
     var fontSmoothing: Bool = true
+#if DEBUG
+    var forceContextCreationFailureForTesting = false
+#endif
 
-    func rasterize(font: CTFont, glyph: CGGlyph) -> GlyphRasterization {
+    func rasterize(font: CTFont, glyph: CGGlyph) -> GlyphRasterizationResult {
+        rasterize(font: font, glyph: glyph,
+                  metrics: GlyphMetrics.measure(font: font, glyph: glyph))
+    }
+
+    /// Rasterizes with the same unrounded bounds used by slot fitting.
+    /// This path performs no Core Text bounds or advance query.
+    func rasterize(font: CTFont, glyph: CGGlyph, metrics: GlyphMetrics) -> GlyphRasterizationResult {
         var glyphVar = glyph
-        let rect = CTFontGetBoundingRectsForGlyphs(font, .default, &glyphVar, nil, 1)
+        let rect = metrics.inkBounds
         if rect.width <= 0 || rect.height <= 0 {
             return .empty
         }
@@ -33,6 +38,11 @@ final class CoreTextGlyphRasterizer {
             return .empty
         }
 
+#if DEBUG
+        if forceContextCreationFailureForTesting {
+            return .transientFailure
+        }
+#endif
         let bytesPerPixel = 4
         var pixels = Array(repeating: UInt8(0), count: width * height * bytesPerPixel)
         let drew = pixels.withUnsafeMutableBytes { raw -> Bool in
@@ -75,7 +85,7 @@ final class CoreTextGlyphRasterizer {
             return true
         }
         if !drew {
-            return .failed
+            return .transientFailure
         }
 
         var isColor = false
@@ -92,10 +102,10 @@ final class CoreTextGlyphRasterizer {
         }
 
         return .bitmap(GlyphBitmap(width: width,
-                                   height: height,
-                                   bearing: CGPoint(x: minX, y: minY),
-                                   pixels: pixels,
-                                   isColor: isColor))
+                                  height: height,
+                                  bearing: CGPoint(x: minX, y: minY),
+                                  pixels: pixels,
+                                  isColor: isColor))
     }
 }
 #endif
