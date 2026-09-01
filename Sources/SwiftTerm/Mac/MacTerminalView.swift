@@ -342,30 +342,6 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// Experimental GPU path: CoreText glyph atlas + Metal quads.
     /// Limitations: image caching is basic; GPU path is still evolving.
     private var useMetalRenderer = false
-    private let metalFrameBudget = MetalFrameBudget()
-    private var metalRendererGeneration: UInt64 = 0
-    // Also fences a retry already dequeued from the budget but not run on main.
-    private var pendingMetalRebindGeneration: UInt64?
-    private var lastMetalRecovery: TimeInterval?
-
-    /// Called only after automatic recovery has finally fallen back to Core
-    /// Graphics. The terminal, selection, scrollback and input session survive.
-    /// Delivered synchronously on main, outside renderer/owner locks, with
-    /// `isUsingMetalRenderer == false` and the Core Graphics path active.
-    public final var metalRendererFallbackHandler: (@MainActor @Sendable (MetalError) -> Void)?
-#if DEBUG
-    var metalRecoveryTestTime: TimeInterval?
-    var metalGenerationForTesting: UInt64 { metalRendererGeneration }
-    var metalBoundWindowForTesting: NSWindow? { metalBoundWindow }
-    private(set) var metalReplacementBeforeRemovalForTesting: (submittedFrames: Int, oldSurfaceAttached: Bool)?
-    var metalOutstandingFramesForTesting: Int { metalFrameBudget.outstandingCount }
-
-    func deliverMetalFailureForTesting(_ error: MetalError, generation: UInt64) {
-        handleMetalFailure(error, generation: generation)
-    }
-
-    func rebindMetalForTesting() { rebindMetalRendererToWindow() }
-#endif
     /// The NSWindow that the current `metalView`'s CAMetalLayer is bound to.
     /// CAMetalLayer's binding to a window's WindowServer surface doesn't
     /// survive being reparented across NSWindow instances — `present(_:)`
@@ -451,9 +427,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
 
     func startRenderLoopIfNeeded () {
-        guard activeRenderLoop() == nil, pendingMetalRebindGeneration == nil,
-              metalBoundWindow === window,
-              usesMetalLayerSurfaceSetting, metalView?.needsExternalDrawCall == true else {
+        guard usesMetalLayerSurfaceSetting, metalView?.needsExternalDrawCall == true else {
             return
         }
         let owner = renderOwner
@@ -644,11 +618,6 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// ```
     ///
     /// You can switch back to CoreGraphics at any time by passing `false`.
-    /// Runtime failures automatically rebuild Metal once; a second failure
-    /// within 30 seconds falls back to CoreGraphics. At most two outstanding
-    /// frames may span retired generations. If neither completes, Metal stays
-    /// unavailable until one completes, including across explicit toggles.
-    /// The terminal and its input session are never recreated for recovery.
     ///
     /// - Parameter enabled: Pass `true` to activate Metal rendering, or
     ///   `false` to revert to CoreGraphics.
@@ -672,14 +641,13 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             if metalView != nil {
                 return
             }
-            guard metalFrameBudget.hasCapacity else { throw MetalError.inFlightLimitReached }
             guard let device = MTLCreateSystemDefaultDevice() else {
                 throw MetalError.deviceUnavailable
             }
             let surface = makeMetalView(frame: bounds, device: device)
-            let renderer = try MetalTerminalRenderer(target: surface, frameBudget: metalFrameBudget)
-            advanceMetalRendererGeneration()
-            configureMetalRenderer(renderer)
+            let renderer = try MetalTerminalRenderer(target: surface)
+            let frameSignal = frameDriver.signal
+            renderer.requestRedraw = { frameSignal.markDirty() }
             renderOwner.installMetalRenderer(
                 renderer,
                 needsExternalDraw: surface.needsExternalDrawCall)
@@ -694,27 +662,13 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             needsDisplay = false
             surface.requestDisplay()
         } else {
-            disableMetalRenderer()
+            stopRenderLoop()
+            guard renderOwner.removeMetalRenderer() else {
+                startRenderLoopIfNeeded()
+                throw MetalError.rendererBusy
+            }
+            detachMetalRendererUI()
         }
-    }
-
-    private func cancelPendingMetalRebind() {
-        pendingMetalRebindGeneration = nil
-        metalFrameBudget.cancelRetry()
-    }
-
-    private func advanceMetalRendererGeneration() {
-        cancelPendingMetalRebind()
-        metalRendererGeneration &+= 1
-    }
-
-    private func disableMetalRenderer() {
-        stopRenderLoop()
-        unbindSurface(metalView)
-        advanceMetalRendererGeneration()
-        renderOwner.removeMetalRenderer()
-        detachMetalRendererUI()
-        useMetalRenderer = false
     }
 
     /// Detaches the Metal surface after the render owner has released it.
@@ -763,25 +717,15 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// Selects the Metal surface, rebuilding it if Metal is already running.
     ///
     /// Throws for the same reasons ``setUseMetal(_:)`` does — the rebuild can
-    /// fail to create a device, renderer or shader library. A failed explicit
-    /// change keeps the previous renderer and surface choice intact.
+    /// fail to create a device, renderer or shader library — in which case the
+    /// view falls back to Core Graphics rather than keeping a dead surface.
     public func setUsesMetalLayerSurface(_ enabled: Bool) throws {
         guard usesMetalLayerSurfaceSetting != enabled else { return }
-        let previousSetting = usesMetalLayerSurfaceSetting
-        let wasRendering = isUsingRenderLoop
         usesMetalLayerSurfaceSetting = enabled
         // Not running Metal: the choice applies the next time it starts.
         guard useMetalRenderer else { return }
-        do {
-            try replaceMetalRendererSurface()
-        } catch {
-            usesMetalLayerSurfaceSetting = previousSetting
-            if metalBoundWindow === window, pendingMetalRebindGeneration == nil {
-                renderOwner.setMetalRenderingSuspended(false)
-                if wasRendering { startRenderLoopIfNeeded() }
-            }
-            throw error
-        }
+        try updateMetalRenderer(enabled: false)
+        try updateMetalRenderer(enabled: true)
     }
 
     private var usesMetalLayerSurfaceSetting =
@@ -869,8 +813,8 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// cursor), with the scroller and the progress bar above it. When there
     /// is no attached caret view and `replacing` is non-nil, the new view takes
     /// the old one's z-position instead. Actually removing the old view is the
-    /// caller's responsibility — replacement inserts the new surface first
-    /// so the hierarchy is never empty, even when no drawable is available.
+    /// caller's responsibility — the rebind path defers removal until after
+    /// the new view has drawn its first frame so the hierarchy is never empty.
     func insertMetalView(_ newView: NSView, replacing oldView: NSView?) {
         if let caretView = caretView, caretView.superview === self {
             addSubview(newView, positioned: .below, relativeTo: caretView)
@@ -903,108 +847,109 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     ///
     /// To avoid the visible CoreGraphics-fallback flash that a naive
     /// disable/enable toggle produces, the new view is built and inserted
-    /// before the old one is removed. An immediate draw attempt submits the
-    /// first frame without waiting for GPU completion; the frame driver retries
-    /// when no drawable is available yet. At the in-flight limit, a completion
-    /// retries the rebind asynchronously while the old surface stays paused;
-    /// ordinary backpressure is not a failure.
+    /// before the old one is removed, and we force a synchronous draw plus a
+    /// belt-and-braces `setNeedsDisplay` so the new layer has content the
+    /// moment it is in the hierarchy.
     ///
     /// On failure (renderer init throws), we fall back to CoreGraphics
     /// rendering rather than leaving a frozen Metal view in place — a
     /// degraded but responsive terminal beats a dead one.
-    private func rebindMetalRendererToWindow() {
-        do {
-            try replaceMetalRendererSurface()
-        } catch MetalError.inFlightLimitReached {
-            // Ordinary reparenting is not a health failure. Keep the current
-            // generation paused until one of its outstanding frames releases.
-            guard pendingMetalRebindGeneration == nil else { return }
-            let generation = metalRendererGeneration
-            pendingMetalRebindGeneration = generation
-            metalFrameBudget.retryWhenAvailable { [weak self] in
-                Task { @MainActor in
-                    guard let self, self.uiShutdownState == .active,
-                          self.useMetalRenderer, self.metalRendererGeneration == generation,
-                          self.pendingMetalRebindGeneration == generation else { return }
-                    self.pendingMetalRebindGeneration = nil
-                    self.rebindMetalRendererToWindow()
-                }
-            }
-        } catch {
-            finishAutomaticMetalFallback(error as? MetalError ?? .deviceUnavailable)
+    private func rebindMetalRendererToWindow(_ targetWindow: NSWindow) {
+        // Swapping the surface out from under an in-flight frame would have the
+        // render loop present into a layer that is already off screen.
+        withRenderLoopSuspended {
+            rebindMetalRendererToWindowLocked(targetWindow)
+        }
+        // Outside the suspension on purpose: stopping the loop waits on the
+        // same lock, so doing it from the failure path inside would deadlock.
+        if metalView == nil {
+            stopRenderLoop()
         }
     }
 
-    private func configureMetalRenderer(_ renderer: MetalTerminalRenderer) {
-        let generation = metalRendererGeneration
-        let frameSignal = frameDriver.signal
-        renderer.requestRedraw = { frameSignal.markDirty() }
-        renderer.health.configure(failure: { [weak self] error in
-            self?.handleMetalFailure(error, generation: generation)
-        })
-    }
-
-    private func handleMetalFailure(_ error: MetalError, generation: UInt64) {
-        guard uiShutdownState == .active, useMetalRenderer,
-              generation == metalRendererGeneration else { return }
-#if DEBUG
-        let now = metalRecoveryTestTime ?? ProcessInfo.processInfo.systemUptime
-#else
-        let now = ProcessInfo.processInfo.systemUptime
-#endif
-        if let lastMetalRecovery, now - lastMetalRecovery < 30 {
-            finishAutomaticMetalFallback(error)
+    private func rebindMetalRendererToWindowLocked(_ targetWindow: NSWindow) {
+        guard useMetalRenderer, let oldView = metalView else { return }
+        // Reuse the old view's MTLDevice when possible so we don't churn
+        // GPUs unnecessarily on multi-GPU or eGPU setups.
+        guard let device = oldView.renderDevice ?? MTLCreateSystemDefaultDevice() else {
+            disableMetalRendererAfterRebindFailure(error: MetalError.deviceUnavailable)
             return
         }
-        lastMetalRecovery = now
-        do {
-            try replaceMetalRendererSurface()
-        } catch {
-            finishAutomaticMetalFallback(error as? MetalError ?? .deviceUnavailable)
-        }
-    }
 
-    private func finishAutomaticMetalFallback(_ error: MetalError) {
-        // Nonthrowing CPU retirement cannot leave a frozen Metal surface
-        // active while reporting Core Graphics fallback to the host.
-        disableMetalRenderer()
-        metalRendererFallbackHandler?(error)
-    }
-
-    private func replaceMetalRendererSurface() throws {
-        guard useMetalRenderer, let oldView = metalView else { return }
-        stopRenderLoop() // drains frameLock, not a GPU semaphore
-        renderOwner.setMetalRenderingSuspended(true)
-        guard metalFrameBudget.hasCapacity else { throw MetalError.inFlightLimitReached }
-        guard let device = oldView.renderDevice ?? MTLCreateSystemDefaultDevice() else {
-            throw MetalError.deviceUnavailable
-        }
         let newView = makeMetalView(frame: oldView.frame, device: device)
-        let newRenderer = try MetalTerminalRenderer(target: newView, frameBudget: metalFrameBudget)
-        unbindSurface(oldView)
-        advanceMetalRendererGeneration()
-        configureMetalRenderer(newRenderer)
-        renderOwner.replaceMetalRenderer(
-            newRenderer, needsExternalDraw: newView.needsExternalDrawCall)
+
+        let newRenderer: MetalTerminalRenderer
+        do {
+            newRenderer = try MetalTerminalRenderer(target: newView)
+            let frameSignal = frameDriver.signal
+            newRenderer.requestRedraw = { frameSignal.markDirty() }
+        } catch {
+            disableMetalRendererAfterRebindFailure(error: error)
+            return
+        }
+        guard renderOwner.replaceMetalRenderer(
+            newRenderer,
+            needsExternalDraw: newView.needsExternalDrawCall)
+        else {
+#if canImport(os)
+            os_log("SwiftTerm: kept the current Metal surface because its renderer is busy",
+                   type: .error)
+#endif
+            return
+        }
         let newDrawDelegate = bindSurface(newView)
 
-        // Keep a surface attached throughout replacement. A missing first
-        // drawable is ordinary backpressure, not another health failure.
+        // Critical sequence: the new layer must have visible content before
+        // the old view is removed. Force a synchronous draw, plus a
+        // `setNeedsDisplay` belt-and-braces in case the synchronous draw bails
+        // out (e.g. the new layer hasn't acquired its first drawable yet).
         insertMetalView(newView, replacing: oldView)
+        if refreshSnapshotForMetal() {
+            if newView.needsExternalDrawCall {
+                renderOwner.renderMetal()
+            } else if let frame = newView.acquireDrawableFrame() {
+                renderOwner.renderMetal(frame: frame)
+            }
+            renderOwner.discardPreparedMetalSnapshot()
+        }
+        newView.requestDisplay()
+
+        unbindSurface(oldView)
+        oldView.removeFromSuperview()
+
         metalView = newView
         metalDrawDelegate = newDrawDelegate
-        metalBoundWindow = window
-        drawMetalFrameNow()
-#if DEBUG
-        metalReplacementBeforeRemovalForTesting = (
-            renderOwner.completedMetalRenders, oldView.superview === self)
-#endif
-        oldView.removeFromSuperview()
-        newView.requestDisplay()
-        frameDriver.markDirty()
-        if window != nil { startRenderLoopIfNeeded() }
+        metalBoundWindow = targetWindow
     }
 
+    /// Tears down the Metal renderer and reverts to CoreGraphics rendering
+    /// after an unrecoverable rebind failure. Keeps the terminal usable when
+    /// the GPU path can't be restored.
+    private func disableMetalRendererAfterRebindFailure(error: Error) {
+        guard renderOwner.removeMetalRenderer() else {
+#if canImport(os)
+            os_log("SwiftTerm: could not replace or remove the busy Metal renderer: %{public}@",
+                   type: .error, String(describing: error))
+#endif
+            return
+        }
+#if canImport(os)
+        os_log("SwiftTerm: Metal renderer rebind failed; falling back to CoreGraphics: %{public}@",
+               type: .error, String(describing: error))
+#endif
+        unbindSurface(metalView)
+        metalView?.removeFromSuperview()
+        metalView = nil
+        metalDrawDelegate = nil
+        metalBoundWindow = nil
+        useMetalRenderer = false
+        if let caretView = caretView {
+            caretView.isHidden = false
+            caretView.updateCursorStyle()
+        }
+        needsDisplay = true
+        invalidateTerminalContents()
+    }
 #endif
 
     open override func viewDidMoveToWindow() {
@@ -1015,7 +960,6 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         frameDriver.markDirty()
         if window == nil {
 #if canImport(MetalKit)
-            cancelPendingMetalRebind()
             stopRenderLoop()
 #endif
             stopWindowMouseMovedFallback()
@@ -1031,10 +975,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 #if canImport(MetalKit)
         guard useMetalRenderer, let currentWindow = window else { return }
         if currentWindow !== metalBoundWindow {
-            rebindMetalRendererToWindow()
-        } else {
-            cancelPendingMetalRebind()
-            renderOwner.setMetalRenderingSuspended(false)
+            rebindMetalRendererToWindow(currentWindow)
         }
         startRenderLoopIfNeeded()
 #endif
@@ -1148,8 +1089,8 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// An owner must call this method when it permanently releases the view.
     /// A temporary `window == nil` transition is not permanent teardown.
     ///
-    /// Committed GPU work retires asynchronously. No GPU wait is needed and
-    /// a stalled command does not prevent permanent UI shutdown.
+    /// Returns `false` when committed GPU work is still active. In that case,
+    /// the complete Metal graph stays attached and the owner must retry.
     @MainActor
     @discardableResult
     public func updateUiClosed() -> Bool {
@@ -1159,7 +1100,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 #if canImport(MetalKit)
         stopRenderLoop()
         if useMetalRenderer {
-            disableMetalRenderer()
+            guard renderOwner.removeMetalRenderer() else { return false }
+            detachMetalRendererUI()
+            useMetalRenderer = false
         }
 #endif
         stopSelectionAutoScrollTimer()

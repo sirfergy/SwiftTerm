@@ -30,23 +30,6 @@ struct MetalRendererConcurrencyTests {
         #expect(redraws.withLock { $0 } == 1)
     }
 
-    @Test @MainActor func retirementInvalidatesRedrawAndQueuedBlinkStart() {
-        let redraws = Locked(0)
-        let state = MetalRedrawState()
-        state.configure { redraws.withLock { $0 += 1 } }
-        let controller = MetalCursorBlinkController(redrawState: state)
-        #expect(state.setCursorBlinkWanted(true))
-        state.markPendingRedraw()
-        state.invalidate()
-        controller.apply(shouldBlink: true)
-        state.requestRedraw()
-        state.markPendingRedraw()
-        #expect(!state.consumePendingRedraw())
-        #expect(!state.setCursorBlinkWanted(true))
-        #expect(!controller.isRunning)
-        #expect(redraws.withLock { $0 } == 0)
-    }
-
     @Test @MainActor func cursorBlinkControllerOwnsTimerOnMainActor() {
         let redraws = Locked(0)
         let state = MetalRedrawState()
@@ -66,31 +49,6 @@ struct MetalRendererConcurrencyTests {
         controller.apply(shouldBlink: false)
         #expect(!controller.isRunning)
         #expect(state.cursorBlinkOn)
-    }
-
-    @Test func frameBudgetCoalescesAndCancelsCapacityRetries() {
-        let budget = MetalFrameBudget()
-        let deliveries = Locked<[Int]>([])
-        #expect(budget.acquire())
-        #expect(budget.acquire())
-        budget.retryWhenAvailable { deliveries.withLock { $0.append(-1) } }
-        budget.retryWhenAvailable {
-            // Reading the budget here also verifies delivery is outside its lock.
-            deliveries.withLock { $0.append(budget.outstandingCount) }
-        }
-        #expect(deliveries.withLock { $0 }.isEmpty)
-        budget.release()
-        budget.release()
-        #expect(deliveries.withLock { $0 } == [1])
-        budget.retryWhenAvailable { deliveries.withLock { $0.append(0) } }
-        #expect(deliveries.withLock { $0 } == [1, 0])
-        #expect(budget.acquire())
-        #expect(budget.acquire())
-        budget.retryWhenAvailable { deliveries.withLock { $0.append(-2) } }
-        budget.cancelRetry()
-        budget.release()
-        budget.release()
-        #expect(deliveries.withLock { $0 } == [1, 0])
     }
 
     @Test func bufferRecyclerRetainsAndReturnsCompletedBuffers() throws {
