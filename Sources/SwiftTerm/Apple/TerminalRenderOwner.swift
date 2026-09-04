@@ -301,6 +301,8 @@ final class TerminalRenderOwner: Sendable {
               pixelY.map({ $0 >= 0 && $0 < Int.max }) ?? true,
               let session = currentSession() else { return nil }
         let terminal = session.terminal
+        precondition(!terminal.terminalLock.isLockedByCurrentThread,
+                     "Mouse input cannot be sent from a terminal callback")
         return terminal.terminalLock.withLock {
             let flags = terminal.encodeButton(button: button, release: release,
                                                shift: shift, meta: meta, control: control)
