@@ -547,7 +547,8 @@ public class LocalProcess {
             return (state.generation, reaper, terminateRequested)
         }
 
-        let writeFd = dup(childfd)
+        // Embedders can protect childfd, but cannot reach this private alias.
+        let writeFd = fcntl(childfd, F_DUPFD_CLOEXEC, 0)
         let writeChannel: DispatchIO?
         if writeFd >= 0 {
             writeChannel = DispatchIO(type: .stream, fileDescriptor: writeFd, queue: writeQueue, cleanupHandler: { _ in
