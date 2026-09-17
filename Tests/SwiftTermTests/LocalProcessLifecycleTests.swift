@@ -434,6 +434,66 @@ final class LocalProcessLifecycleTests: XCTestCase {
         XCTAssertEqual(secondDelegate.receivedData, Array("second".utf8))
     }
 
+    func testNextProcessDoesNotInheritPreviousPTYWriteDescriptor() throws {
+        let firstTerminated = expectation(description: "first process terminated")
+        let secondTerminated = expectation(description: "descriptor probe terminated")
+        let firstDelegate = LifecycleDelegate()
+        let secondDelegate = LifecycleDelegate()
+        firstDelegate.onTermination = { firstTerminated.fulfill() }
+        secondDelegate.onTermination = { secondTerminated.fulfill() }
+        let first = LocalProcess(delegate: firstDelegate)
+        let second = LocalProcess(delegate: secondDelegate)
+        defer {
+            first.terminate()
+            second.terminate()
+        }
+        first.startProcess(
+            executable: "/bin/sh",
+            args: ["-c", "read line; printf 'echo:%s' \"$line\""])
+        let master = first.childfd
+        XCTAssertGreaterThanOrEqual(master, 0)
+        // Embedders protect the public master; the private write channel must
+        // not leak an alias when another terminal forks and execs.
+        XCTAssertEqual(fcntl(master, F_SETFD, FD_CLOEXEC), 0)
+        var identity = stat()
+        XCTAssertEqual(fstat(master, &identity), 0)
+#if os(macOS)
+        let descriptorDirectory = "/dev/fd"
+#else
+        let descriptorDirectory = "/proc/self/fd"
+#endif
+        let aliases = try FileManager.default.contentsOfDirectory(atPath: descriptorDirectory)
+            .compactMap(Int32.init)
+            .filter { descriptor in
+                var candidate = stat()
+                return fstat(descriptor, &candidate) == 0
+                    && candidate.st_dev == identity.st_dev
+                    && candidate.st_ino == identity.st_ino
+                    && candidate.st_rdev == identity.st_rdev
+            }
+        XCTAssertGreaterThanOrEqual(aliases.count, 2, "Both PTY descriptors must still be live")
+        second.startProcess(
+            executable: "/bin/sh",
+            args: ["-c", """
+                for fd in \(aliases.map(String.init).joined(separator: " ")); do
+                    if test -t "$fd"; then
+                        printf 'inherited PTY: %s' "$fd"
+                        exit 1
+                    fi
+                done
+                printf isolated
+                """, "descriptor-probe"])
+        wait(for: [secondTerminated], timeout: 5)
+        XCTAssertEqual(secondDelegate.exitCode, 0)
+        XCTAssertEqual(String(decoding: secondDelegate.receivedData, as: UTF8.self), "isolated")
+
+        first.send(data: ArraySlice("still-connected\n".utf8))
+        wait(for: [firstTerminated], timeout: 5)
+        XCTAssertEqual(firstDelegate.exitCode, 0)
+        XCTAssertTrue(String(decoding: firstDelegate.receivedData, as: UTF8.self)
+            .contains("echo:still-connected"))
+    }
+
     private func waitUntil(
         timeout: TimeInterval,
         interval: TimeInterval = 0.001,
