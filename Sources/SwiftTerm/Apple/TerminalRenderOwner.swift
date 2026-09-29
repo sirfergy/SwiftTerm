@@ -297,8 +297,8 @@ final class TerminalRenderOwner: Sendable {
         default: return nil
         }
         guard col >= 0, row >= 0, col <= Int.max - 33, row <= Int.max - 33,
-              pixelX.map({ $0 >= 0 }) ?? true,
-              pixelY.map({ $0 >= 0 }) ?? true,
+              pixelX.map({ $0 >= 0 && $0 < Int.max }) ?? true,
+              pixelY.map({ $0 >= 0 && $0 < Int.max }) ?? true,
               let session = currentSession() else { return nil }
         let terminal = session.terminal
         return terminal.terminalLock.withLock {
