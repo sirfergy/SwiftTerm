@@ -47,7 +47,7 @@ struct TerminalMouseEventTests {
         case 1005: #expect(delegate.writes.first == [27, 91, 77, 60, 0xc6, 0xb1, 41])
         case 1006: #expect(delegate.writes.first == Array("\u{1b}[<28;401;9M".utf8))
         case 1015: #expect(delegate.writes.first == Array("\u{1b}[60;401;9M".utf8))
-        case 1016: #expect(delegate.writes.first == Array("\u{1b}[<28;90;100M".utf8))
+        case 1016: #expect(delegate.writes.first == Array("\u{1b}[<28;91;101M".utf8))
         default: Issue.record("Unexpected test protocol")
         }
     }

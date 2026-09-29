@@ -7,6 +7,7 @@
 //  Created by Miguel de Icaza on 3/20/20.
 //
 
+#if !SWIFTTERM_EMBEDDED
 #if os(macOS)
 import Foundation
 import AppKit
@@ -121,6 +122,30 @@ class CaretView: NSView {
         layer?.removeAllAnimations()
         layer?.opacity = 1
     }
+
+    /// Makes the cursor visible now and delays the next blink cycle. Repeated
+    /// input therefore keeps the cursor visible until typing pauses.
+    func resetBlinkAfterInput () {
+        let canBlink = !tracksFocus || (terminal?.hasFocus ?? true)
+        guard canBlink else { return }
+        switch style {
+        case .blinkUnderline, .blinkBlock, .blinkBar:
+            layer?.removeAllAnimations()
+            layer?.opacity = 1
+            guard let layer else { return }
+            let anim = CABasicAnimation(keyPath: #keyPath(CALayer.opacity))
+            anim.duration = 0.7
+            anim.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + 0.7
+            anim.autoreverses = true
+            anim.repeatCount = .infinity
+            anim.fromValue = 1
+            anim.toValue = 0
+            anim.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            layer.add(anim, forKey: #keyPath(CALayer.opacity))
+        case .steadyBar, .steadyBlock, .steadyUnderline:
+            break
+        }
+    }
     
     public var defaultCaretColor = NSColor.selectedControlColor
     
@@ -163,3 +188,5 @@ extension CaretView: @MainActor CALayerDelegate {
     }
 }
 #endif
+
+#endif // !SWIFTTERM_EMBEDDED
