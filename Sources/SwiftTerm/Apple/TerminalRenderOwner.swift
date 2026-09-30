@@ -325,7 +325,8 @@ final class TerminalRenderOwner: Sendable {
             isAlternateBuffer: terminal.isCurrentBufferAlternate,
             applicationCursor: terminal.applicationCursor,
             mouseMode: terminal.mouseMode,
-            keyboardEnhancementFlags: terminal.keyboardEnhancementFlags)
+            keyboardEnhancementFlags: terminal.keyboardEnhancementFlags,
+            focusReportingEnabled: terminal.sendFocus)
     }
 
     func inputStateSnapshot() -> TerminalInputStateSnapshot? {
