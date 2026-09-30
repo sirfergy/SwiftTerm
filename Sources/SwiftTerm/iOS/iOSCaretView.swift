@@ -6,6 +6,7 @@
 //  Created by Miguel de Icaza on 3/20/20.
 //
 
+#if !SWIFTTERM_EMBEDDED
 #if os(iOS) || os(visionOS)
 import Foundation
 import UIKit
@@ -129,6 +130,25 @@ class CaretView: UIView {
         layer.removeAllAnimations()
         layer.opacity = 1
     }
+
+    /// Makes the cursor visible now and delays the next blink cycle. Repeated
+    /// input therefore keeps the cursor visible until typing pauses.
+    func resetBlinkAfterInput () {
+        let canBlink = !tracksFocus || (superview?.isFirstResponder ?? true)
+        guard canBlink else { return }
+        switch style {
+        case .blinkUnderline, .blinkBlock, .blinkBar:
+            layer.removeAllAnimations()
+            layer.opacity = 1
+            guard window != nil else { return }
+            UIView.animate(withDuration: 0.7, delay: 0.7,
+                           options: [.autoreverse, .repeat, .curveEaseIn]) {
+                self.layer.opacity = 0
+            }
+        case .steadyBar, .steadyBlock, .steadyUnderline:
+            break
+        }
+    }
     
     public var defaultCaretColor = UIColor.gray
     
@@ -162,3 +182,5 @@ class CaretView: UIView {
 
 }
 #endif
+
+#endif // !SWIFTTERM_EMBEDDED

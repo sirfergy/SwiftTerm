@@ -6,13 +6,15 @@
 //  Copyright © 2019 Miguel de Icaza. All rights reserved.
 //
 
+#if !SWIFTTERM_EMBEDDED
 import Foundation
+#endif
 
 enum ArgumentError : Error {
     case invalidArgument(String)
 }
 
-class CircularList<T> {
+final class CircularList<T> {
     private var array: [T?]
     private var startIndex: Int
     var count: Int {
@@ -218,7 +220,7 @@ class CircularList<T> {
     }
 }
 
-internal class CircularBufferLineList {
+internal final class CircularBufferLineList {
 #if DEBUG
     private var array: [BufferLine?]
 #else
@@ -282,7 +284,17 @@ internal class CircularBufferLineList {
     /// `unowned(unsafe)` is sound here because the list is a private stored
     /// property of the buffer: it cannot outlive its owner, and no path hands a
     /// list to anyone else. See `Docs/io-cpu-profile.md` §3.1.
+#if SWIFTTERM_EMBEDDED
+    var owner: Buffer? = nil
+#else
     unowned(unsafe) var owner: Buffer! = nil
+#endif
+
+    // Embedded needs a breakable optional owner to release its object graph.
+    // Normal builds use the non-optional `unowned(unsafe)` owner above. Keep
+    // the callbacks below direct in that configuration: they run for every
+    // attached or recycled row, and using `owner?.` for both builds caused a
+    // measurable scrolling regression.
 
     /// True only for a buffer's live line list.
     ///
@@ -319,19 +331,31 @@ internal class CircularBufferLineList {
         _read {
             let idx = getCyclicIndex(index)
             if array[idx] == nil {
+#if SWIFTTERM_EMBEDDED
+                array[idx] = owner!.makeEmptyLine(idx)
+#else
                 array[idx] = owner.makeEmptyLine(idx)
+#endif
             }
             yield array[idx]!
         }
         set (newValue){
             array [getCyclicIndex(index)] = newValue
+#if SWIFTTERM_EMBEDDED
+            if isLive { owner?.lineAttached(newValue) }
+#else
             if isLive { owner.lineAttached(newValue) }
+#endif
       }
     }
 
     func push (_ value: BufferLine)
     {
+#if SWIFTTERM_EMBEDDED
+        if isLive { owner?.lineAttached(value) }
+#else
         if isLive { owner.lineAttached(value) }
+#endif
         array [getCyclicIndex(count)] = value
         if count == array.count {
             startIndex = startIndex + 1
@@ -341,24 +365,38 @@ internal class CircularBufferLineList {
         } else {
             count = count + 1
         }
+#if SWIFTTERM_EMBEDDED
+        if isLive { owner?.lineDidPush(hasImages: value.images != nil) }
+#else
         if isLive { owner.lineDidPush(hasImages: value.images != nil) }
+#endif
     }
 
     /// Recycles a row with state that already belongs to the owner's arena.
     func recycle(clearCell: PackedCell, isWrapped: Bool,
                  bidiState: BidiPresentationState)
     {
+        assert(startIndex < array.count)
         precondition(count == maxLength, "can only recycle when the buffer is full")
-        let index = getCyclicIndex(count)
-        startIndex += 1
-        startIndex = startIndex % maxLength
+        // A full ring makes getCyclicIndex(count) equal to startIndex.
+        let index = startIndex
+        let next = startIndex &+ 1
+        startIndex = next == maxLength ? 0 : next
         // The array owns the line until this function finishes using it.
+#if SWIFTTERM_EMBEDDED
+        let line = array[index]!
+#else
         unowned(unsafe) let line = array[index]!
+#endif
         // The line object is being destroyed for reuse. Clear its cells and
         // metadata with one generation change.
         let hadImages = line.recycle(with: clearCell, isWrapped: isWrapped,
                                      bidiState: bidiState)
+#if SWIFTTERM_EMBEDDED
+        if isLive { owner?.lineWillRecycle(hadImages: hadImages) }
+#else
         if isLive { owner.lineWillRecycle(hadImages: hadImages) }
+#endif
     }
 
     @discardableResult
@@ -393,7 +431,11 @@ internal class CircularBufferLineList {
         }
         for i in 0..<ic {
             change(start + i)
+#if SWIFTTERM_EMBEDDED
+            if isLive { owner?.lineAttached(items [i]) }
+#else
             if isLive { owner.lineAttached(items [i]) }
+#endif
             array [getCyclicIndex(start + i)] = items [i]
         }
 
@@ -401,6 +443,9 @@ internal class CircularBufferLineList {
         if Int(count) + ic > array.count {
             let countToTrim = count + items.count - array.count
             startIndex = startIndex + countToTrim
+            if !array.isEmpty {
+                startIndex %= array.count
+            }
             count = array.count
         } else {
             count = count + items.count
@@ -411,6 +456,9 @@ internal class CircularBufferLineList {
     {
         let c = count > self.count ? self.count : count
         startIndex = startIndex + c
+        if !array.isEmpty {
+            startIndex %= array.count
+        }
         self.count -= count
     }
 
@@ -443,6 +491,9 @@ internal class CircularBufferLineList {
                 while self._count > maxLength {
                     self._count -= 1
                     startIndex += 1
+                    if !array.isEmpty {
+                        startIndex %= array.count
+                    }
                     // trimmed callback invoke
                 }
             }
@@ -490,13 +541,34 @@ internal class CircularBufferLineList {
                     // reference to the preceding slot without ARC work.
                     var destination = (firstPhysicalIndex &+ top) % capacity
                     if top < bottom {
-                        for _ in top..<bottom {
-                            var source = destination + 1
-                            if source == capacity {
-                                source = 0
+                        let moveCount = bottom - top
+                        if destination + moveCount < capacity {
+                            // The existing raw-pointer binding transfers the
+                            // array's strong references without ARC operations.
+                            // This range is contiguous and overlaps by one slot,
+                            // so memmove preserves that ownership transfer.
+#if SWIFTTERM_EMBEDDED
+                            for offset in 0..<moveCount {
+                                slots[destination + offset] = slots[destination + offset + 1]
                             }
-                            slots[destination] = slots[source]
-                            destination = source
+#else
+                            let byteCount = moveCount *
+                                MemoryLayout<UnsafeMutableRawPointer?>.stride
+                            memmove(slots.baseAddress!.advanced(by: destination),
+                                    slots.baseAddress!.advanced(by: destination + 1),
+                                    byteCount)
+#endif
+                            destination += moveCount
+                        } else {
+                            // Keep the element loop when the circular range wraps.
+                            for _ in top..<bottom {
+                                var source = destination + 1
+                                if source == capacity {
+                                    source = 0
+                                }
+                                slots[destination] = slots[source]
+                                destination = source
+                            }
                         }
                     }
                     // The former last line is already in the preceding slot. Do
@@ -509,9 +581,47 @@ internal class CircularBufferLineList {
         recycledLine.recycle(with: clearCell, isWrapped: isWrapped,
                              bidiState: bidiState)
         if isLive {
+#if SWIFTTERM_EMBEDDED
+            owner?.lineWillRecycle(hadImages: hadImages)
+#else
             owner.lineWillRecycle(hadImages: hadImages)
+#endif
         }
         return true
+    }
+
+    /// Empties the ring in place and gives it `newMaxLength` slots.
+    ///
+    /// `Buffer.clear` uses this instead of replacing its list object. That
+    /// keeps `Buffer._lines` a `let`, which lets the optimizer borrow the list
+    /// at +0 on every ring access instead of retaining it around each load in
+    /// case the property is reassigned underneath the access.
+    ///
+    /// Like `push`, `recycle`, and `shiftUpAndRecycle`, a live list keeps the
+    /// owner's image accounting correct itself: every dropped line that
+    /// carried images is reported before it goes.
+    func reset(maxLength newMaxLength: Int) {
+        if isLive {
+            for line in array where line?.images != nil {
+#if SWIFTTERM_EMBEDDED
+                owner?.lineWillRecycle(hadImages: true)
+#else
+                owner.lineWillRecycle(hadImages: true)
+#endif
+            }
+        }
+        _count = 0
+        startIndex = 0
+        // Changing the length is the one allocation; the didSet builds the
+        // new array and copies the old references into it. Clearing the
+        // slots afterwards releases them without a second allocation, and an
+        // unchanged length allocates nothing.
+        if maxLength != newMaxLength {
+            maxLength = newMaxLength
+        }
+        for index in array.indices {
+            array[index] = nil
+        }
     }
 
     var isFull: Bool {

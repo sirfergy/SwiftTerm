@@ -6,6 +6,8 @@ public struct TerminalInputStateSnapshot: Sendable {
     public let applicationCursor: Bool
     public let mouseMode: Terminal.MouseMode
     public let keyboardEnhancementFlags: KittyKeyboardFlags
+    /// Whether the application enabled focus reports (DECSET 1004).
+    public let focusReportingEnabled: Bool
 }
 
 /// Selects a bounded region of the active buffer to copy.
