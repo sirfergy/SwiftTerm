@@ -31,7 +31,7 @@ struct TerminalMouseEventTests {
         let modes = "\u{1b}[?1000h" + (protocolMode == 0 ? "" : "\u{1b}[?\(protocolMode)h")
         view.feed(text: modes)
         terminal.feed(text: modes)
-        for button in [0, 1, 2, 4, 5] {
+        for button in [0, 1, 2, 4, 5, 6, 7] {
             for release in [false, true] {
                 let flags = terminal.encodeButton(button: button, release: release,
                                                    shift: true, meta: true, control: true)
@@ -50,6 +50,24 @@ struct TerminalMouseEventTests {
         case 1016: #expect(delegate.writes.first == Array("\u{1b}[<28;91;101M".utf8))
         default: Issue.record("Unexpected test protocol")
         }
+    }
+
+    /// Mode 1005 sends values below 128 as one byte, like xterm, and larger
+    /// values as two-byte UTF-8.
+    @Test func utf8ModeSendsValuesBelow128AsOneByte() {
+        let view = TerminalView(frame: .zero)
+        let delegate = Delegate()
+        view.terminalDelegate = delegate
+        view.feed(text: "\u{1b}[?1000h\u{1b}[?1005h")
+        // Button 7 with Shift, Meta, and Control encodes to 127.
+        view.sendMouseEvent(button: 7, release: false, shift: true, meta: true, control: true,
+                            col: 0, row: 0)
+        // Column 94 is the last one-byte position; row 95 needs two bytes.
+        view.sendMouseEvent(button: 0, release: false, col: 94, row: 95)
+        #expect(delegate.writes == [
+            [0x1b, 0x5b, 0x4d, 0x7f, 0x21, 0x21],
+            [0x1b, 0x5b, 0x4d, 0x20, 0x7f, 0xc2, 0x80],
+        ])
     }
 
     @Test func mouseReportsAreOrderedAndDoNotRegisterSemanticInput() {

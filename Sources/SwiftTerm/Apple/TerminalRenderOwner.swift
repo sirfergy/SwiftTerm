@@ -293,7 +293,7 @@ final class TerminalRenderOwner: Sendable {
                          control: Bool, col: Int, row: Int,
                          pixelX: Int?, pixelY: Int?) -> [UInt8]? {
         switch button {
-        case 0, 1, 2, 4, 5: break
+        case 0, 1, 2, 4, 5, 6, 7: break
         default: return nil
         }
         guard col >= 0, row >= 0, col <= Int.max - 33, row <= Int.max - 33,
@@ -301,6 +301,8 @@ final class TerminalRenderOwner: Sendable {
               pixelY.map({ $0 >= 0 && $0 < Int.max }) ?? true,
               let session = currentSession() else { return nil }
         let terminal = session.terminal
+        precondition(!terminal.terminalLock.isLockedByCurrentThread,
+                     "Mouse input cannot be sent from a terminal callback")
         return terminal.terminalLock.withLock {
             let flags = terminal.encodeButton(button: button, release: release,
                                                shift: shift, meta: meta, control: control)
