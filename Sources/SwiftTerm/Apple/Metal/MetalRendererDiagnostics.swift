@@ -1,3 +1,4 @@
+#if !SWIFTTERM_EMBEDDED
 #if os(macOS) || os(iOS) || os(visionOS)
 import Foundation
 import Metal
@@ -89,4 +90,5 @@ final class MetalRendererDiagnostics: Sendable {
         }
     }
 }
+#endif
 #endif

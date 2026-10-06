@@ -1,3 +1,4 @@
+#if !SWIFTTERM_EMBEDDED
 #if os(macOS) || os(iOS) || os(visionOS) || os(macCatalyst)
 /// Copied input modes and dimensions, without copying terminal contents.
 public struct TerminalInputStateSnapshot: Sendable {
@@ -56,4 +57,5 @@ public struct TerminalContentSnapshot: Sendable {
     public let liveTopRow: Int
     public let rows: [TerminalContentRowSnapshot]
 }
+#endif
 #endif
