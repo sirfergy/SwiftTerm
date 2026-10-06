@@ -540,15 +540,29 @@ final class LocalProcessLifecycleTests: XCTestCase {
         let descriptorDirectory = "/dev/fd"
 #else
         let descriptorDirectory = "/proc/self/fd"
+        // Swift's Glibc/Musl overlays do not expose the TIOCGPTN ioctl macro.
+        let tiocgptn = UInt(0x80045430)
+        var masterPTYNumber = UInt32.max
+        XCTAssertEqual(ioctl(master, tiocgptn, &masterPTYNumber), 0)
 #endif
         let aliases = try FileManager.default.contentsOfDirectory(atPath: descriptorDirectory)
             .compactMap(Int32.init)
             .filter { descriptor in
                 var candidate = stat()
-                return fstat(descriptor, &candidate) == 0
-                    && candidate.st_dev == identity.st_dev
-                    && candidate.st_ino == identity.st_ino
-                    && candidate.st_rdev == identity.st_rdev
+                guard fstat(descriptor, &candidate) == 0,
+                      candidate.st_dev == identity.st_dev,
+                      candidate.st_ino == identity.st_ino,
+                      candidate.st_rdev == identity.st_rdev else {
+                    return false
+                }
+#if os(Linux)
+                var candidatePTYNumber = UInt32.max
+                guard ioctl(descriptor, tiocgptn, &candidatePTYNumber) == 0,
+                      candidatePTYNumber == masterPTYNumber else {
+                    return false
+                }
+#endif
+                return true
             }
         XCTAssertGreaterThanOrEqual(aliases.count, 2, "Both PTY descriptors must still be live")
         second.startProcess(
