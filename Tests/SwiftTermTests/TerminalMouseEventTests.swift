@@ -11,7 +11,7 @@ struct TerminalMouseEventTests {
         func send(source: TerminalView, data: ArraySlice<UInt8>) {
             // This would recursively acquire TerminalLock if delivery happened
             // inside the encoding transaction.
-            #expect(source.terminalInputStateSnapshot() != nil)
+            _ = source.terminalStateSnapshot()
             writes.append(Array(data))
         }
         func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {}

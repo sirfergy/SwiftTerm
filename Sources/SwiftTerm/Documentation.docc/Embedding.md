@@ -74,6 +74,15 @@ that animates, it is 10x worse, because the deferral is what disarms the
 re-entrancy guard. SwiftTerm cannot tell the two apart, so it restricts
 coalescing to live resizes and leaves the rest synchronous.
 
+## Custom pointer routing
+
+Use `TerminalView.sendMouseEvent` on the main actor to send a mouse response
+with zero-based cell coordinates and optional pixel coordinates. It uses the
+negotiated mouse protocol, but the host decides whether to report the event.
+Delivery is synchronous after releasing the terminal lock, and mouse responses
+do not register keyboard input or an OSC 133 semantic submission. Use
+`send(data:)` for keyboard input.
+
 ## Feeding and sending from other threads
 
 ``TerminalView/feed(byteArray:)`` and ``TerminalView/send(data:)`` are callable
@@ -119,11 +128,6 @@ termination from a consumer. The optional process-output notification runs on
 the parse worker after the consumer returns, even if it buffered rather than
 parsed the bytes. Without a consumer, background parsing continues to use the
 borrowed-byte fast path.
-
-For custom pointer routing, `sendMouseEvent` uses the negotiated terminal
-encoding and delivers a response after unlocking. It deliberately bypasses
-keyboard semantic-input registration; `send(data:)` is still the API for
-keyboard input.
 
 ## Delegate callbacks and the terminal lock
 
