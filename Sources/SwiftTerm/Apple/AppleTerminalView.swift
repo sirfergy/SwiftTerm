@@ -538,6 +538,7 @@ struct FrameViewState: Sendable {
     let appearance: FrameAppearance
     let customBlockGlyphs: Bool
     let useBrightColors: Bool
+    let minimumContrastRatio: CGFloat
     let bidiHostPolicy: BidiHostPolicy
     let glyphFallbackProvider: (any TerminalGlyphFallbackProvider)?
 
@@ -578,6 +579,7 @@ struct FrameViewState: Sendable {
         appearance = view.frameCaptureCache.appearance(for: view)
         customBlockGlyphs = view.customBlockGlyphs
         useBrightColors = view.useBrightColors
+        minimumContrastRatio = view.minimumContrastRatio
         bidiHostPolicy = view.bidiHostPolicy
         glyphFallbackProvider = view.glyphFallbackProvider
     }
@@ -643,6 +645,7 @@ struct SnapshotRenderContext {
     let commandActive: Bool
     let customBlockGlyphs: Bool
     let useBrightColors: Bool
+    let minimumContrastRatio: CGFloat
     let bidiHostPolicy: BidiHostPolicy
     let glyphFallbackProvider: (any TerminalGlyphFallbackProvider)?
     let cols: Int
@@ -701,6 +704,7 @@ struct SnapshotRenderContext {
         commandActive = style.commandActive
         customBlockGlyphs = viewState.customBlockGlyphs
         useBrightColors = viewState.useBrightColors
+        minimumContrastRatio = viewState.minimumContrastRatio
         bidiHostPolicy = viewState.bidiHostPolicy
         glyphFallbackProvider = viewState.glyphFallbackProvider
         self.cols = cols
@@ -721,6 +725,7 @@ struct SnapshotRenderContext {
             identityHasher.combine(color.hash)
         }
         identityHasher.combine(useBrightColors)
+        identityHasher.combine(minimumContrastRatio)
         identity = UInt64(bitPattern: Int64(identityHasher.finalize()))
     }
 
@@ -1018,17 +1023,6 @@ struct GlyphMetrics {
 
 private let terminalFramePresentedHandler = LockedVoidCallback()
 
-/// The current terminal grid size.
-public struct TerminalDimensions: Sendable, Equatable {
-    public let cols: Int
-    public let rows: Int
-
-    public init(cols: Int, rows: Int) {
-        self.cols = cols
-        self.rows = rows
-    }
-}
-
 /// A copied row from the visible terminal region.
 public struct TerminalVisibleRowSnapshot: Sendable, Equatable {
     public let row: Int
@@ -1061,6 +1055,28 @@ public struct TerminalViewStateSnapshot: Sendable {
     public let cursorStyle: CursorStyle
     public let ansi256PaletteStrategy: Ansi256PaletteStrategy
     public let visibleRows: [TerminalVisibleRowSnapshot]
+
+    public init(
+        dimensions: TerminalDimensions,
+        cursor: Position,
+        viewportRow: Int,
+        bracketedPasteMode: Bool,
+        currentBidiState: BidiPresentationState,
+        bidiArrowKeySwap: Bool,
+        cursorStyle: CursorStyle,
+        ansi256PaletteStrategy: Ansi256PaletteStrategy,
+        visibleRows: [TerminalVisibleRowSnapshot]
+    ) {
+        self.dimensions = dimensions
+        self.cursor = cursor
+        self.viewportRow = viewportRow
+        self.bracketedPasteMode = bracketedPasteMode
+        self.currentBidiState = currentBidiState
+        self.bidiArrowKeySwap = bidiArrowKeySwap
+        self.cursorStyle = cursorStyle
+        self.ansi256PaletteStrategy = ansi256PaletteStrategy
+        self.visibleRows = visibleRows
+    }
 }
 
 /// Delivers input to one main-actor sink in FIFO order.
@@ -1671,12 +1687,22 @@ extension TerminalView {
     }
 
     /// Copies input modes and dimensions without copying any rows.
+    ///
+    /// Safe to call from any thread, but not from a terminal delegate callback
+    /// that already holds the terminal lock.
     /// Returns nil when no terminal session is attached.
     public nonisolated func terminalInputStateSnapshot() -> TerminalInputStateSnapshot? {
         renderOwner.inputStateSnapshot()
     }
 
     /// Copies a bounded region and its input state in one transaction.
+    ///
+    /// Safe to call from any thread, but not from a terminal delegate callback
+    /// that already holds the terminal lock.
+    ///
+    /// The snapshot is useful for inspection and bounded text capture. It does
+    /// not include images, hyperlinks, or palette values, and is not sufficient
+    /// to reproduce the full display.
     /// Returns nil when no terminal session is attached. The returned values
     /// remain valid after later feeds, resizes, scrolls, and history trimming.
     public nonisolated func terminalContentSnapshot(
@@ -1972,7 +1998,13 @@ extension TerminalView {
         // let cellWidth = (0..<95).reduce(into: 0) { partialResult, idx in
         //     partialResult = max(partialResult, sizes[idx].width)
         // }
-        let glyph = fontSet.normal.glyph(withName: "W")
+        // Look W up by character, not by glyph name: fonts whose glyphs are
+        // unnamed or named by CID (BIZ UDGothic, STHeiti, Songti) have no glyph
+        // named "W", and the name lookup returns .notdef, which is usually a
+        // full em wide and spreads the text across twice as many columns.
+        var characters: [UniChar] = [0x57]
+        var glyphs: [CGGlyph] = [0]
+        let glyph = CTFontGetGlyphsForCharacters (fontSet.normal, &characters, &glyphs, 1) ? NSGlyph (glyphs [0]) : fontSet.normal.glyph(withName: "W")
         let cellWidth = fontSet.normal.advancement(forGlyph: glyph).width
         #else
         let fontAttributes = [NSAttributedString.Key.font: fontSet.normal]
@@ -2501,6 +2533,7 @@ extension TerminalView {
         if flags.contains (.dim) {
             fgColor = fgColor.dimmedColor (towards: bgColor)
         }
+        fgColor = fgColor.withContrast (atLeast: minimumContrastRatio, against: bgColor)
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
             .foregroundColor: fgColor,
@@ -4456,6 +4489,27 @@ extension TerminalView {
     public nonisolated func feed (text: String)
     {
         feedSender.feed(text: text)
+    }
+
+    /// Current OSC 7501 records. This value snapshot is safe to read without
+    /// the terminal lock. It includes inherited program names.
+    public nonisolated var programStatusRecords: [TerminalProgramStatus] {
+        programStatusState.withLock { $0 }
+    }
+
+    public nonisolated func programStatusChanged(source: Terminal, records: [TerminalProgramStatus]) {
+        programStatusState.withLock { $0 = records }
+        eventQueue.post(.programStatusChanged)
+    }
+
+    /// Removes a status record and its descendants. An empty id removes all.
+    public func clearProgramStatus(id: String = "") {
+        withTerminal { $0.clearProgramStatus(id: id) }
+    }
+
+    /// Call this after a remote process exits and its output is parsed.
+    public func programStatusProcessExited() {
+        withTerminal { $0.programStatusProcessExited() }
     }
          
     /**

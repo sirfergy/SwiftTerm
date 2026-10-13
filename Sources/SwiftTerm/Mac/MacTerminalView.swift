@@ -1284,6 +1284,17 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// Controls weather to use high ansi colors, if false terminal will use bold text instead of high ansi colors
     public var useBrightColors: Bool = true
 
+    /// The least contrast, as a WCAG ratio from 1 to 21, that text keeps against its background. Text whose colors
+    /// fall below it, such as colors a program picked for a background of the other brightness, is darkened or
+    /// lightened just enough to reach it. Powerline separators, box drawing, and block elements keep their colors.
+    /// The default, 1, keeps every color as it is; 4.5 matches WCAG AA and VS Code's terminal default.
+    public var minimumContrastRatio: CGFloat = 1 {
+        didSet {
+            guard minimumContrastRatio != oldValue else { return }
+            colorsChanged ()
+        }
+    }
+
     /// Controls whether this view applies the terminal's BiDi presentation state.
     public var bidiHostPolicy: BidiHostPolicy = .respectTerminal {
         didSet {
@@ -1999,6 +2010,61 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// OS specific feature.
     public var optionAsMetaKey: Bool = true
 
+    /// When `optionAsMetaKey` is `false`, Option goes to the OS so the keyboard
+    /// layout can compose the character it puts behind the key (Option+Q is "@"
+    /// on a Turkish layout, Option+2 on a Czech one). The layout composes
+    /// nothing for the keys that carry no text: the arrows, Home, End, Page
+    /// Up/Down, Insert, Delete, the function keys, the keypad, Escape, Enter,
+    /// Tab and Backspace. Set this to `true` and Option stays Meta on those
+    /// keys while the layout keeps the rest: Option+Left still moves a word
+    /// back, Option+Backspace still deletes one and Option+Q still types "@".
+    ///
+    /// This is what iTerm2 does when its Option key is set to "Normal", and
+    /// what kitty and Ghostty do with Option not acting as Alt. It has no
+    /// effect while `optionAsMetaKey` is `true`, which already makes Option
+    /// Meta on every key.
+    public var optionAsMetaKeyForFunctionalKeys: Bool = false
+
+    /// Whether Option acts as Meta for this key: on every key when
+    /// `optionAsMetaKey` is on, and on the keys the layout composes nothing
+    /// for when `optionAsMetaKeyForFunctionalKeys` is on. Escape, Enter, Tab
+    /// and Backspace compose nothing, so they count as functional here, as
+    /// they do in iTerm2. While the input method holds marked text, every key
+    /// belongs to it.
+    private func optionIsMeta(for event: NSEvent) -> Bool {
+        if optionAsMetaKey {
+            return true
+        }
+        guard optionAsMetaKeyForFunctionalKeys, !hasMarkedText() else {
+            return false
+        }
+        return textlessKey(for: event) != nil || kittyFunctionalKey(from: event) != nil
+    }
+
+    /// Escape, Enter, Tab and Backspace by their physical key. AppKit keeps
+    /// Shift in `charactersIgnoringModifiers`, so Shift+Tab reads as U+0019
+    /// there; the key code says Tab whatever the modifiers.
+    private func textlessKey(for event: NSEvent) -> KittyFunctionalKey? {
+        switch Int(event.keyCode) {
+        case kVK_Escape: return .escape
+        case kVK_Return: return .enter
+        case kVK_Tab: return .tab
+        case kVK_Delete: return .backspace
+        default: return nil
+        }
+    }
+
+    /// Sends Option plus Escape, Enter, Tab or Backspace through the encoder,
+    /// which applies the Meta prefix (or the kitty Alt modifier), Shift on Tab
+    /// and the `backspaceSendsControlH` byte the same way it does for the key
+    /// without Option.
+    private func sendMetaTextlessKey(_ event: NSEvent, eventType: KittyKeyboardEventType) -> Bool {
+        guard let key = textlessKey(for: event) else { return false }
+        return sendKittyFunctionalKey(key,
+                                      modifiers: kittyModifiers(from: event, includeOption: true),
+                                      eventType: eventType)
+    }
+
     private struct PendingKittyKeyEvent {
         let event: NSEvent
         let eventType: KittyKeyboardEventType
@@ -2083,9 +2149,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
         if keyboardEnhancementFlags.isEmpty,
            !eventFlags.contains(.command),
-           (!eventFlags.contains(.option) || optionAsMetaKey),
+           (!eventFlags.contains(.option) || optionIsMeta(for: event)),
            let functionKey = kittyFunctionalKey(from: event) {
-            let modifiers = kittyModifiers(from: event, includeOption: optionAsMetaKey)
+            let modifiers = kittyModifiers(from: event, includeOption: optionIsMeta(for: event))
             let isUnmodifiedPageKey = (functionKey == .pageUp || functionKey == .pageDown)
                 && modifiers.intersection([.shift, .alt, .ctrl]).isEmpty
                 && !applicationCursor
@@ -2134,7 +2200,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
             if let functionKey = kittyFunctionalKey(from: event) {
                 let kittyEvent = KittyKeyEvent(key: .functional(functionKey),
-                                               modifiers: kittyModifiers(from: event, includeOption: optionAsMetaKey),
+                                               modifiers: kittyModifiers(from: event, includeOption: optionIsMeta(for: event)),
                                                eventType: repeatEventType,
                                                text: kittyTextForFunctionalKey(functionKey, event: event),
                                                shiftedKey: nil,
@@ -2145,7 +2211,12 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 }
             }
 
-            if eventFlags.contains(.control) || (optionAsMetaKey && eventFlags.contains(.option)) {
+            if optionIsMeta(for: event) && eventFlags.contains(.option),
+               sendMetaTextlessKey(event, eventType: repeatEventType) {
+                return
+            }
+
+            if eventFlags.contains(.control) || (optionIsMeta(for: event) && eventFlags.contains(.option)) {
                 if let kittyEvent = kittyTextEvent(from: event, eventType: repeatEventType),
                    sendKittyEvent(kittyEvent) {
                     return
@@ -2162,7 +2233,10 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             if event.charactersIgnoringModifiers == "o" {
                 optionAsMetaKey.toggle()
             }
-        } else if optionAsMetaKey && eventFlags.contains (.option) {
+        } else if optionIsMeta(for: event) && eventFlags.contains (.option) {
+            if sendMetaTextlessKey(event, eventType: event.isARepeat ? .repeatPress : .press) {
+                return
+            }
             if let rawCharacter = event.charactersIgnoringModifiers {
                 if let fs = rawCharacter.unicodeScalars.first {
                     switch Int (fs.value) {
@@ -2324,7 +2398,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         if !kittyIsComposing {
             let mods: KittyKeyboardModifiers
             if let pending = pendingKittyKeyEvent {
-                mods = kittyModifiers(from: pending.event, includeOption: optionAsMetaKey)
+                mods = kittyModifiers(from: pending.event, includeOption: optionIsMeta(for: pending.event))
             } else {
                 mods = []
             }
@@ -2485,7 +2559,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 // text directly instead, matching how kitty/Ghostty handle
                 // AltGr layers.
                 if let pendingEvent,
-                   !optionAsMetaKey,
+                   !optionIsMeta(for: pendingEvent.event),
                    pendingEvent.event.modifierFlags.contains(.option),
                    !pendingEvent.event.modifierFlags.contains(.control),
                    !pendingEvent.event.modifierFlags.contains(.command),
@@ -3044,7 +3118,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
         let baseLayout = kittyBaseLayoutKey(from: event)
         let baseLayoutKey = baseLayout == baseScalar ? nil : baseLayout
-        let modifiers = kittyModifiers(from: event, includeOption: optionAsMetaKey)
+        let modifiers = kittyModifiers(from: event, includeOption: optionIsMeta(for: event))
         return KittyKeyEvent(key: .unicode(baseScalar.value),
                              modifiers: modifiers,
                              eventType: eventType,
@@ -3056,7 +3130,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
     private func kittyKeyEvent(from event: NSEvent, eventType: KittyKeyboardEventType, text: String? = nil) -> KittyKeyEvent? {
         if let functionKey = kittyFunctionalKey(from: event) {
-            let modifiers = kittyModifiers(from: event, includeOption: optionAsMetaKey)
+            let modifiers = kittyModifiers(from: event, includeOption: optionIsMeta(for: event))
             return KittyKeyEvent(key: .functional(functionKey),
                                  modifiers: modifiers,
                                  eventType: eventType,
@@ -4449,6 +4523,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
     /// Coalescing channel for idempotent notifications (io-gaps.md G6).
     nonisolated let eventQueue = TerminalEventQueue()
+    nonisolated let programStatusState = Locked<[TerminalProgramStatus]>([])
 
     /// Set by `updateScroller`, applied by `frameTick` under the lock.
 
@@ -4487,6 +4562,8 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             }
         case .bell:
             deliverBell()
+        case .programStatusChanged:
+            terminalDelegate?.programStatusChanged(source: self, records: programStatusRecords)
         }
     }
 
