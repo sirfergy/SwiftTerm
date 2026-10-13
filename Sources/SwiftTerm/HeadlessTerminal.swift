@@ -73,6 +73,7 @@ public class HeadlessTerminal : TerminalDelegate, LocalProcessDelegate {
     public func processTerminated(_ source: LocalProcess, exitCode: Int32?) {
         callbackLock.lock()
         defer { callbackLock.unlock() }
+        terminal.terminalLock.withLock { terminal.programStatusProcessExited() }
         onEnd(exitCode)
     }
     
@@ -118,6 +119,28 @@ public class HeadlessTerminal : TerminalDelegate, LocalProcessDelegate {
     public func send(_ text: String) {
         send (data: ([UInt8] (text.utf8))[...])
         
+    }
+
+    /// Copies input modes and dimensions without copying any rows.
+    ///
+    /// Do not call this method from a terminal delegate callback that already
+    /// holds the terminal lock.
+    public func terminalInputStateSnapshot() -> TerminalInputStateSnapshot {
+        terminal.inputStateSnapshot()
+    }
+
+    /// Copies a bounded region and its input state in one transaction.
+    ///
+    /// Do not call this method from a terminal delegate callback that already
+    /// holds the terminal lock.
+    ///
+    /// The snapshot is useful for inspection and bounded text capture. It does
+    /// not include images, hyperlinks, or palette values, and is not sufficient
+    /// to reproduce the full display.
+    public func terminalContentSnapshot(
+        region: TerminalContentRegion
+    ) -> TerminalContentSnapshot {
+        terminal.contentSnapshot(region: region)
     }
 
     /// Changes scrollback size for the underlying terminal at runtime.

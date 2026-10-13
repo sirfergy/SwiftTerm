@@ -83,8 +83,20 @@ essential for terminal applications like Emacs that rely on the Meta key:
 terminalView.optionAsMetaKey = true
 ```
 
-On iOS with an external keyboard, the same property is available. The iOS view
-also supports toggling it at runtime with Option-Command-O.
+With it `false`, the key goes to the OS, which composes whatever the keyboard
+layout puts behind it (Option+Q is `@` on a Turkish layout). The layout composes
+nothing for the arrows, Home, End, the function keys, Enter, Tab and Backspace,
+so `optionAsMetaKeyForFunctionalKeys` keeps Option as Meta on those keys alone:
+Option+Left still moves a word back while Option+Q still types `@`, which is
+what iTerm2 does when its Option key is set to "Normal":
+
+```swift
+terminalView.optionAsMetaKey = false
+terminalView.optionAsMetaKeyForFunctionalKeys = true
+```
+
+On iOS with an external keyboard, `optionAsMetaKey` is available too. The iOS
+view also supports toggling it at runtime with Option-Command-O.
 
 ### Mouse Reporting
 
@@ -229,6 +241,11 @@ terminalView.antiAliasCustomBlockGlyphs = true
 
 // Use bright colors for bold text (traditional terminal behavior)
 terminalView.useBrightColors = true
+
+// Darken or lighten text that falls below a WCAG contrast ratio against
+// its background, such as colors a program picked for a dark theme shown
+// on a light one. 1, the default, keeps every color as it is.
+terminalView.minimumContrastRatio = 4.5
 ```
 
 ### GPU-Accelerated Rendering

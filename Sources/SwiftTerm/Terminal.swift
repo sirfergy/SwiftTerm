@@ -312,6 +312,11 @@ public protocol TerminalDelegate: AnyObject {
      *  - report: the parsed progress report
      */
     func progressReport(source: Terminal, report: Terminal.ProgressReport)
+
+    /// Receives the current OSC 7501 records after a report or removal.
+    /// The default implementation does nothing. The terminal lock is held
+    /// when a host feeds or changes the terminal under that lock.
+    func programStatusChanged(source: Terminal, records: [TerminalProgramStatus])
     
     /**
      * Invoked to create an image from an RGBA buffer at the current cursor position
@@ -384,6 +389,7 @@ struct SynchronizedOutputWatchdogCounters {
  * that is provided in the constructor call.
  */
 open class Terminal {
+    var programStatusStore = TerminalProgramStatusStore()
     public enum ProgressReportState: Int, Sendable {
         case remove = 0
         case set = 1
@@ -405,9 +411,11 @@ open class Terminal {
     let MINIMUM_COLS = 2
     let MINIMUM_ROWS = 1
 
-    /// Guards all mutable terminal state. `Terminal` methods do not acquire
-    /// this lock themselves; callers that feed, render, or query the terminal
-    /// synchronize through this object.
+    /// Guards all mutable terminal state. Most `Terminal` methods do not
+    /// acquire this lock themselves; callers that feed, render, or query the
+    /// terminal synchronize through this object. Methods whose documentation
+    /// says they copy state under one terminal lock acquire it themselves and
+    /// must not be called while it is already held.
     public let terminalLock = TerminalLock()
     
     /// The current terminal columns (counting from 1)
@@ -984,7 +992,7 @@ open class Terminal {
     /// Represents the mouse operation mode that the terminal is currently using and higher level
     /// implementations should use the functions in this enumeration to determine what events to
     /// send
-    public enum MouseMode: Sendable {
+    public enum MouseMode: Sendable, Equatable {
         /// No mouse events are reported
         case off
         
@@ -1335,6 +1343,7 @@ open class Terminal {
         _rows = max (options.rows, MINIMUM_ROWS)
         
         if isReset {
+            clearProgramStatus()
             resetNormalBuffer()
             activateNormalBuffer(clearAlt: false)
             resetSemanticPromptState(clearingScreenMarks: true)
@@ -2638,10 +2647,21 @@ open class Terminal {
         } else {
             buffer.y = by + 1
             movedToNextLine = true
+            // An explicit line feed into an existing row ends any soft wrap
+            // that row carried, as in xterm.js. Programs that repaint in place
+            // (Claude Code and other Ink apps redraw the screen with CR LF after
+            // a SIGWINCH) write new lines over rows that a narrowing reflow
+            // marked as continuations; a surviving flag makes the next widening
+            // reflow join those unrelated lines onto the ones above them. The
+            // scrolling branch above needs nothing: it brings in an unwrapped row.
             let line = buffer.lines[buffer.yBase + buffer.y]
-            if !line.isWrapped {
-                line.bidiState = _currentBidiState
+            if line.isWrapped {
+                // Splitting a wrapped paragraph can change letter shapes
+                // on both sides. Request a redraw for both paragraphs.
+                line.isWrapped = false
+                updateRange(borrowing: buffer, startLine: by, endLine: buffer.y)
             }
+            line.bidiState = _currentBidiState
         }
         
         // If the end of the line is hit, prevent this action from wrapping around to the next line.
@@ -3408,6 +3428,9 @@ open class Terminal {
                 allocates = !buffer.canReuseSemanticGroup(atRow: originRow)
             }
             if allocates {
+                // Repaint, right, and continuation markers do not start a
+                // new shell prompt and must preserve live program status.
+                if action == "A" { programStatusProcessExited() }
                 buffer.beginSemanticPromptGroup(originRow: originRow)
                 // F.2a: `freshSemanticPromptLine`'s LF stamped this landing row
                 // with the OUTGOING group's epoch before we allocated. Clear it
@@ -9992,6 +10015,9 @@ public extension TerminalDelegate {
     }
 
     func progressReport(source: Terminal, report: Terminal.ProgressReport) {
+    }
+
+    func programStatusChanged(source: Terminal, records: [TerminalProgramStatus]) {
     }
     
     func createImageFromBitmap (source: Terminal, bytes: inout [UInt8], width: Int, height: Int){
